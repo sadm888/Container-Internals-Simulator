@@ -1,0 +1,29 @@
+[2026-03-02 14:10:59] === Container Simulator started (simulator PID 1314) ===
+[2026-03-02 14:11:31] Container 1: CREATED
+[2026-03-02 14:11:31] Container 1: RUNNING (host PID 1317)
+[2026-03-02 14:12:08] Container 2: CREATED
+[2026-03-02 14:12:08] Container 2: RUNNING (host PID 1324)
+[2026-03-02 14:13:16] === Container Simulator started (simulator PID 1357) ===
+[2026-03-02 14:13:22] Container 1: CREATED
+[2026-03-02 14:13:23] Container 1: RUNNING (host PID 1360)
+[2026-03-02 14:13:27] Container 2: CREATED
+[2026-03-02 14:13:27] Container 2: RUNNING (host PID 1361)
+[2026-03-02 14:14:30] === Container Simulator started (simulator PID 1392) ===
+[2026-03-02 14:14:35] Container 1: CREATED
+[2026-03-02 14:14:35] Container 1: RUNNING (host PID 1393)
+[2026-03-02 14:14:39] Container 2: CREATED
+[2026-03-02 14:14:39] Container 2: RUNNING (host PID 1394)
+[2026-03-02 14:14:44] Container 1: STOPPED by user (host PID 1393 killed)
+[2026-03-02 14:14:50] Container 2: KILLED on simulator shutdown
+[2026-03-02 14:14:50] === Container Simulator stopped ===
+[2026-03-02 14:24:14] === Container Simulator started (simulator PID 1525) ===
+[2026-03-02 14:24:22] Container 1: CREATED
+[2026-03-02 14:24:22] Container 1: RUNNING (host PID 1526)
+[2026-03-02 14:24:25] Container 2: CREATED
+[2026-03-02 14:24:25] Container 2: RUNNING (host PID 1529)
+[2026-03-02 14:24:29] Container 1: STOPPED by user (host PID 1526 killed)
+[2026-03-02 14:24:33] Container 3: CREATED
+[2026-03-02 14:24:34] Container 3: RUNNING (host PID 1530)
+[2026-03-02 14:24:40] Container 2: KILLED on simulator shutdown
+[2026-03-02 14:24:40] Container 3: KILLED on simulator shutdown
+[2026-03-02 14:24:40] === Container Simulator stopped ===
