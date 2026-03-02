@@ -1,8 +1,0 @@
-[2026-03-02 18:28:03] === Container Simulator started (simulator PID 2933) ===
-[2026-03-02 18:28:06] container-1: CREATED
-[2026-03-02 18:28:06] container-1: RUNNING (host pid 2934)
-[2026-03-02 18:28:11] container-2: CREATED
-[2026-03-02 18:28:11] container-2: RUNNING (host pid 2937)
-[2026-03-02 18:28:45] container-1: killed on shutdown
-[2026-03-02 18:28:45] container-2: killed on shutdown
-[2026-03-02 18:28:45] === Container Simulator stopped ===
