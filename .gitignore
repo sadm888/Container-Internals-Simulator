@@ -1,0 +1,10 @@
+# build artifacts
+src/*.o
+container-sim
+
+# runtime output
+container.log
+/tmp/container-sim/
+
+# editor
+.vscode/
