@@ -46,11 +46,14 @@ static int container_init(void *arg) {
     gethostname(hn, sizeof(hn));
 
     printf("\n");
-    printf("  container-%d namespace view:\n", a->container_id);
-    printf("    pid      = %d  (host sees a different pid)\n", getpid());
-    printf("    hostname = %s\n", hn);
-    printf("    chroot   = %s\n", jailed ? "active" : "failed");
-    printf("    /proc    = isolated\n");
+    printf("  +--------------------------------------------------+\n");
+    printf("  |  container-%d  —  namespaces active              |\n", a->container_id);
+    printf("  +--------------------------------------------------+\n");
+    printf("  |  pid (inside)  : %-5d  (host sees different)   |\n", getpid());
+    printf("  |  hostname      : %-30s  |\n", hn);
+    printf("  |  chroot        : %-3s                             |\n", jailed ? "on" : "off");
+    printf("  |  /proc         : isolated (mount namespace)      |\n");
+    printf("  +--------------------------------------------------+\n");
     fflush(stdout);
 
     /* sit here until the manager kills us */
