@@ -1,8 +1,8 @@
 CC     = gcc
-CFLAGS = -Wall -Wextra -g -D_GNU_SOURCE
+CFLAGS = -Wall -g -D_GNU_SOURCE
 TARGET = container-sim
 
-SRCS = src/main.c src/container.c src/namespace.c src/filesystem.c src/logger.c
+SRCS = src/main.c src/container.c src/logger.c
 OBJS = $(SRCS:.c=.o)
 
 all: $(TARGET)
@@ -13,10 +13,7 @@ $(TARGET): $(OBJS)
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-run: $(TARGET)
-	sudo ./$(TARGET)
-
 clean:
-	rm -f src/*.o $(TARGET) container.log
+	rm -f src/*.o $(TARGET)
 
-.PHONY: all run clean
+.PHONY: all clean
