@@ -1,136 +1,556 @@
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <signal.h>
-#include <sys/wait.h>
+#include <errno.h>
 #include <sched.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include "container.h"
 #include "logger.h"
 
 #define STACK_SIZE (1024 * 1024)
+#define METADATA_FILE "containers.meta"
+#define METADATA_FILE_TMP "containers.meta.tmp"
 
-static Container *head=NULL;  
-static Container *tail=NULL;  
-static int next_id=1;
+static Container *head = NULL;
+static Container *tail = NULL;
+static int next_sequence = 1;
 
-static int container_child(void *arg){
+static int container_child(void *arg) {
     (void)arg;
-    while(1) {
+    while (1) {
         sleep(1);
     }
     return 0;
 }
 
-//checks if any running containers have exited on their own
-static void poll_states(void) {
-    for (Container *c=head;c!=NULL; c=c->next){
-        if (c->state==STATE_RUNNING){
-            if(waitpid(c->pid,NULL,WNOHANG)>0) {
-                c->state=STATE_STOPPED;
-                strcpy(c->status,"Stopped");
-                log_event("container-%d exited on its own (pid %d)",c->id,c->pid);
-            }
-        }
+static const char *state_to_string(ContainerState state) {
+    switch (state) {
+        case STATE_CREATED:
+            return "CREATED";
+        case STATE_RUNNING:
+            return "RUNNING";
+        case STATE_STOPPED:
+            return "STOPPED";
+        default:
+            return "UNKNOWN";
     }
 }
 
-int container_create(void){
-    Container *c=malloc(sizeof(Container));
-    if(!c){
-        printf("[error] out of memory\n\n");
-        return -1;
+static ContainerState string_to_state(const char *value) {
+    if (strcmp(value, "RUNNING") == 0) {
+        return STATE_RUNNING;
     }
-    c->stack=malloc(STACK_SIZE);
-    if(!c->stack){
-        printf("[error] out of memory\n\n");
-        free(c);
-        return -1;
+    if (strcmp(value, "STOPPED") == 0) {
+        return STATE_STOPPED;
     }
-    char *stack_top=c->stack+STACK_SIZE;
-    pid_t pid=clone(container_child,stack_top,SIGCHLD,NULL);
-    if(pid<0){
-        printf("[error] clone() failed — run with sudo\n\n");
-        free(c->stack);
-        free(c);
-        return -1;
-    }
-    c->id=next_id++;
-    c->pid=pid;
-    c->state=STATE_RUNNING;
-    c->next=NULL;
-    strcpy(c->status,"Running");
-    // append to end of list which is top of stack(+memory space)
-    if(tail==NULL){
-        head=tail=c;
-    } 
-    else{
-        tail->next=c;
-        tail=c;
-    }
-
-    printf("\n");
-    printf("  ┌─────────────────────────────────┐\n");
-    printf("  │  container-%d — started          │\n",c->id);
-    printf("  ├─────────────────────────────────┤\n");
-    printf("  │  id     : %-4d                  │\n",c->id);
-    printf("  │  pid    : %-6d                │\n",pid);
-    printf("  │  status : Running               │\n");
-    printf("  └─────────────────────────────────┘\n\n");
-    log_event("container-%d STARTED (pid %d)",c->id,pid);
-    return c->id;
+    return STATE_CREATED;
 }
 
-int container_list(void){
-    poll_states();
-    printf("\n┌────┬──────────┬──────────┐\n");
-    printf("│ ID │ PID      │ Status   │\n");
-    printf("├────┼──────────┼──────────┤\n");
-    if (head == NULL){
-        printf("│      no containers       │\n");
-    } 
-    else{
-        for(Container *c =head;c!=NULL;c=c->next) {
-            printf("│ %-2d │ %-8d │ %-8s │\n",c->id,c->pid,c->status);
+static void copy_string(char *dst, size_t dst_size, const char *src) {
+    if (dst_size == 0) {
+        return;
+    }
+    if (src == NULL) {
+        dst[0] = '\0';
+        return;
+    }
+    snprintf(dst, dst_size, "%s", src);
+}
+
+static void trim_newline(char *line) {
+    if (line == NULL) {
+        return;
+    }
+    line[strcspn(line, "\r\n")] = '\0';
+}
+
+static void append_container(Container *container) {
+    container->next = NULL;
+    if (tail == NULL) {
+        head = tail = container;
+        return;
+    }
+    tail->next = container;
+    tail = container;
+}
+
+static void remove_container(Container *container) {
+    Container *prev = NULL;
+
+    for (Container *cursor = head; cursor != NULL; cursor = cursor->next) {
+        if (cursor != container) {
+            prev = cursor;
+            continue;
+        }
+
+        if (prev == NULL) {
+            head = cursor->next;
+        } else {
+            prev->next = cursor->next;
+        }
+
+        if (tail == cursor) {
+            tail = prev;
+        }
+        cursor->next = NULL;
+        return;
+    }
+}
+
+static Container *find_container(const char *id) {
+    for (Container *cursor = head; cursor != NULL; cursor = cursor->next) {
+        if (strcmp(cursor->id, id) == 0) {
+            return cursor;
         }
     }
-    printf("└────┴──────────┴──────────┘\n\n");
+    return NULL;
+}
+
+static void free_container_stack(Container *container) {
+    if (container->stack != NULL) {
+        free(container->stack);
+        container->stack = NULL;
+    }
+}
+
+static int save_metadata(void) {
+    FILE *file = fopen(METADATA_FILE_TMP, "w");
+    if (file == NULL) {
+        printf("[error] failed to write container metadata\n\n");
+        log_event("metadata save failed: could not open temp file");
+        return -1;
+    }
+
+    for (Container *cursor = head; cursor != NULL; cursor = cursor->next) {
+        fprintf(file, "%s\t%s\t%d\t%s\t%s\t%s\n",
+                cursor->id,
+                cursor->name,
+                (int)cursor->pid,
+                cursor->hostname,
+                cursor->rootfs,
+                state_to_string(cursor->state));
+    }
+
+    if (fclose(file) != 0) {
+        printf("[error] failed to flush container metadata\n\n");
+        log_event("metadata save failed: fclose");
+        return -1;
+    }
+
+    if (rename(METADATA_FILE_TMP, METADATA_FILE) != 0) {
+        printf("[error] failed to finalize container metadata\n\n");
+        log_event("metadata save failed: rename");
+        return -1;
+    }
+
     return 0;
 }
 
-int container_stop(int id){
-    poll_states();
-    for(Container *c=head;c!=NULL;c=c->next){
-        if(c->id!=id){
-            continue;
-        }
-        if(c->state!=STATE_RUNNING){
-            printf("[manager] container-%d is not running\n\n",id);
-            return -1;
-        }
-        kill(c->pid, SIGKILL);
-        waitpid(c->pid,NULL,0);
-        c->state=STATE_STOPPED;
-        strcpy(c->status,"Stopped");
-        printf("[manager] container-%d stopped\n\n",id);
-        log_event("container-%d STOPPED (pid %d killed)",id,c->pid);
-        return 0;
+static void update_next_sequence(const char *id) {
+    int value = 0;
+
+    if (sscanf(id, "container-%d", &value) == 1 && value >= next_sequence) {
+        next_sequence = value + 1;
     }
-    printf("[error] container %d not found\n\n",id);
-    return -1;
 }
 
-void cleanup_all_containers(void){
-    Container *c=head;
-    while(c!=NULL){
-        Container *next=c->next;
-        if(c->state==STATE_RUNNING){
-            kill(c->pid,SIGKILL);
-            waitpid(c->pid,NULL,0);
-        }
-        free(c->stack);
-        free(c);
-        c=next;
+static int is_pid_alive(pid_t pid) {
+    if (pid <= 0) {
+        return 0;
     }
-    head=tail=NULL;
+
+    if (kill(pid, 0) == 0) {
+        return 1;
+    }
+
+    return errno == EPERM;
+}
+
+static int sync_container_state(Container *container) {
+    int state_changed = 0;
+    int status = 0;
+    pid_t result = 0;
+
+    if (container->state != STATE_RUNNING || container->pid <= 0) {
+        return 0;
+    }
+
+    result = waitpid(container->pid, &status, WNOHANG);
+    if (result > 0) {
+        container->state = STATE_STOPPED;
+        container->pid = -1;
+        free_container_stack(container);
+        log_event("%s exited and was reaped by manager", container->id);
+        return 1;
+    }
+
+    if (result == 0) {
+        return 0;
+    }
+
+    if (errno == ECHILD && !is_pid_alive(container->pid)) {
+        container->state = STATE_STOPPED;
+        container->pid = -1;
+        free_container_stack(container);
+        log_event("%s marked stopped after recovery check", container->id);
+        state_changed = 1;
+    }
+
+    return state_changed;
+}
+
+static void poll_states(void) {
+    int changed = 0;
+
+    for (Container *cursor = head; cursor != NULL; cursor = cursor->next) {
+        changed |= sync_container_state(cursor);
+    }
+
+    if (changed) {
+        save_metadata();
+    }
+}
+
+static int stop_container_process(Container *container, int quiet) {
+    if (container->state != STATE_RUNNING || container->pid <= 0) {
+        if (!quiet) {
+            printf("[manager] %s is not running\n\n", container->id);
+        }
+        return -1;
+    }
+
+    if (kill(container->pid, SIGKILL) != 0 && errno != ESRCH) {
+        if (!quiet) {
+            printf("[error] failed to stop %s\n\n", container->id);
+        }
+        log_event("failed to stop %s (pid %d)", container->id, container->pid);
+        return -1;
+    }
+
+    if (waitpid(container->pid, NULL, 0) < 0 && errno != ECHILD) {
+        if (!quiet) {
+            printf("[error] failed to reap %s\n\n", container->id);
+        }
+        log_event("failed to reap %s (pid %d)", container->id, container->pid);
+        return -1;
+    }
+
+    log_event("%s STOPPED (pid %d)", container->id, container->pid);
+    container->pid = -1;
+    container->state = STATE_STOPPED;
+    free_container_stack(container);
+    save_metadata();
+
+    if (!quiet) {
+        printf("[manager] %s stopped\n\n", container->id);
+    }
+
+    return 0;
+}
+
+static void print_container_banner(const Container *container) {
+    char pid_text[16];
+
+    if (container->pid > 0) {
+        snprintf(pid_text, sizeof(pid_text), "%d", (int)container->pid);
+    } else {
+        copy_string(pid_text, sizeof(pid_text), "-");
+    }
+
+    printf("\n");
+    printf("  id       : %s\n", container->id);
+    printf("  name     : %s\n", container->name);
+    printf("  pid      : %s\n", pid_text);
+    printf("  hostname : %s\n", container->hostname);
+    printf("  rootfs   : %s\n", container->rootfs);
+    printf("  state    : %s\n\n", state_to_string(container->state));
+}
+
+int container_manager_init(void) {
+    FILE *file = fopen(METADATA_FILE, "r");
+    char line[1024];
+    int restored = 0;
+
+    if (file == NULL) {
+        return 0;
+    }
+
+    while (fgets(line, sizeof(line), file) != NULL) {
+        char *fields[6];
+        char *token = NULL;
+        Container *container = NULL;
+        int index = 0;
+
+        trim_newline(line);
+        token = strtok(line, "\t");
+        while (token != NULL && index < 6) {
+            fields[index++] = token;
+            token = strtok(NULL, "\t");
+        }
+
+        if (index != 6) {
+            continue;
+        }
+
+        container = calloc(1, sizeof(*container));
+        if (container == NULL) {
+            fclose(file);
+            printf("[error] out of memory while restoring containers\n\n");
+            return -1;
+        }
+
+        copy_string(container->id, sizeof(container->id), fields[0]);
+        copy_string(container->name, sizeof(container->name), fields[1]);
+        container->pid = (pid_t)atoi(fields[2]);
+        copy_string(container->hostname, sizeof(container->hostname), fields[3]);
+        copy_string(container->rootfs, sizeof(container->rootfs), fields[4]);
+        container->state = string_to_state(fields[5]);
+        container->stack = NULL;
+
+        if (container->state == STATE_RUNNING && !is_pid_alive(container->pid)) {
+            container->state = STATE_STOPPED;
+            container->pid = -1;
+        }
+
+        append_container(container);
+        update_next_sequence(container->id);
+        restored++;
+    }
+
+    fclose(file);
+    poll_states();
+
+    if (restored > 0) {
+        printf("[manager] restored %d container record(s) from %s\n\n",
+               restored,
+               METADATA_FILE);
+        log_event("restored %d container record(s)", restored);
+    }
+
+    return 0;
+}
+
+int container_create(const ContainerSpec *spec, char *out_id, size_t out_id_size) {
+    Container *container = calloc(1, sizeof(*container));
+
+    if (container == NULL) {
+        printf("[error] out of memory\n\n");
+        return -1;
+    }
+
+    snprintf(container->id, sizeof(container->id), "container-%04d", next_sequence++);
+
+    if (spec != NULL && spec->name != NULL && spec->name[0] != '\0') {
+        copy_string(container->name, sizeof(container->name), spec->name);
+    } else {
+        copy_string(container->name, sizeof(container->name), container->id);
+    }
+
+    if (spec != NULL && spec->hostname != NULL && spec->hostname[0] != '\0') {
+        copy_string(container->hostname, sizeof(container->hostname), spec->hostname);
+    } else {
+        copy_string(container->hostname, sizeof(container->hostname), container->name);
+    }
+
+    if (spec != NULL && spec->rootfs != NULL && spec->rootfs[0] != '\0') {
+        copy_string(container->rootfs, sizeof(container->rootfs), spec->rootfs);
+    } else {
+        snprintf(container->rootfs, sizeof(container->rootfs), "./rootfs/%s", container->id);
+    }
+
+    container->pid = -1;
+    container->state = STATE_CREATED;
+    append_container(container);
+
+    if (save_metadata() != 0) {
+        remove_container(container);
+        free(container);
+        return -1;
+    }
+
+    if (out_id != NULL && out_id_size > 0) {
+        copy_string(out_id, out_id_size, container->id);
+    }
+
+    printf("[manager] created %s\n", container->id);
+    print_container_banner(container);
+    log_event("%s CREATED (name=%s hostname=%s rootfs=%s)",
+              container->id,
+              container->name,
+              container->hostname,
+              container->rootfs);
+    return 0;
+}
+
+int container_start(const char *id) {
+    Container *container = NULL;
+    char *stack_top = NULL;
+    pid_t pid = -1;
+
+    if (id == NULL || id[0] == '\0') {
+        printf("[error] usage: start <id>\n\n");
+        return -1;
+    }
+
+    poll_states();
+    container = find_container(id);
+    if (container == NULL) {
+        printf("[error] container %s not found\n\n", id);
+        return -1;
+    }
+
+    if (container->state == STATE_RUNNING) {
+        printf("[manager] %s is already running\n\n", container->id);
+        return -1;
+    }
+
+    container->stack = malloc(STACK_SIZE);
+    if (container->stack == NULL) {
+        printf("[error] out of memory\n\n");
+        return -1;
+    }
+
+    stack_top = container->stack + STACK_SIZE;
+    pid = clone(container_child, stack_top, SIGCHLD, NULL);
+    if (pid < 0) {
+        printf("[error] clone() failed\n\n");
+        log_event("clone() failed for %s", container->id);
+        free_container_stack(container);
+        return -1;
+    }
+
+    container->pid = pid;
+    container->state = STATE_RUNNING;
+
+    if (save_metadata() != 0) {
+        stop_container_process(container, 1);
+        return -1;
+    }
+
+    printf("[manager] started %s\n", container->id);
+    print_container_banner(container);
+    log_event("%s STARTED (pid %d)", container->id, pid);
+    return 0;
+}
+
+int container_stop(const char *id) {
+    Container *container = NULL;
+
+    if (id == NULL || id[0] == '\0') {
+        printf("[error] usage: stop <id>\n\n");
+        return -1;
+    }
+
+    poll_states();
+    container = find_container(id);
+    if (container == NULL) {
+        printf("[error] container %s not found\n\n", id);
+        return -1;
+    }
+
+    return stop_container_process(container, 0);
+}
+
+int container_delete(const char *id) {
+    Container *container = NULL;
+
+    if (id == NULL || id[0] == '\0') {
+        printf("[error] usage: delete <id>\n\n");
+        return -1;
+    }
+
+    poll_states();
+    container = find_container(id);
+    if (container == NULL) {
+        printf("[error] container %s not found\n\n", id);
+        return -1;
+    }
+
+    if (container->state == STATE_RUNNING) {
+        printf("[error] stop %s before deleting it\n\n", container->id);
+        return -1;
+    }
+
+    remove_container(container);
+    if (save_metadata() != 0) {
+        append_container(container);
+        return -1;
+    }
+
+    log_event("%s DELETED", container->id);
+    printf("[manager] deleted %s\n\n", container->id);
+    free_container_stack(container);
+    free(container);
+    return 0;
+}
+
+int container_list(void) {
+    int count = 0;
+
+    poll_states();
+
+    printf("\n");
+    printf("%-16s %-16s %-8s %-16s %-28s %-10s\n",
+           "ID",
+           "NAME",
+           "PID",
+           "HOSTNAME",
+           "ROOTFS",
+           "STATE");
+    printf("-----------------------------------------------------------------------------------------------\n");
+
+    for (Container *cursor = head; cursor != NULL; cursor = cursor->next) {
+        char pid_text[16];
+
+        if (cursor->pid > 0) {
+            snprintf(pid_text, sizeof(pid_text), "%d", (int)cursor->pid);
+        } else {
+            copy_string(pid_text, sizeof(pid_text), "-");
+        }
+
+        printf("%-16s %-16s %-8s %-16s %-28s %-10s\n",
+               cursor->id,
+               cursor->name,
+               pid_text,
+               cursor->hostname,
+               cursor->rootfs,
+               state_to_string(cursor->state));
+        count++;
+    }
+
+    if (count == 0) {
+        printf("no containers found\n");
+    }
+
+    printf("\n");
+    return 0;
+}
+
+void cleanup_all_containers(void) {
+    Container *cursor = head;
+
+    poll_states();
+
+    while (cursor != NULL) {
+        if (cursor->state == STATE_RUNNING) {
+            stop_container_process(cursor, 1);
+        }
+        cursor = cursor->next;
+    }
+
+    save_metadata();
+
+    cursor = head;
+    while (cursor != NULL) {
+        Container *next = cursor->next;
+        free_container_stack(cursor);
+        free(cursor);
+        cursor = next;
+    }
+
+    head = NULL;
+    tail = NULL;
 }

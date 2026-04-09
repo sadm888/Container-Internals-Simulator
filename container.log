@@ -38,3 +38,9 @@
 [2026-03-04 10:24:43] container-1 STARTED (pid 5936)
 [2026-03-04 10:24:50] container-1 STOPPED (pid 5936 killed)
 [2026-03-04 10:24:53] === simulator stopped ===
+[2026-04-09 14:36:35] === simulator started ===
+[2026-04-09 14:36:53] container-0001 CREATED (name=demo hostname=demo-host rootfs=./rootfs/demo)
+[2026-04-09 14:37:05] container-0001 STARTED (pid 23941)
+[2026-04-09 14:37:21] container-0001 STOPPED (pid 23941)
+[2026-04-09 14:37:46] container-0001 DELETED
+[2026-04-09 14:37:52] === simulator stopped ===
