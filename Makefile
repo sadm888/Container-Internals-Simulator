@@ -2,7 +2,7 @@ CC     = gcc
 CFLAGS = -Wall -g -D_GNU_SOURCE
 TARGET = container-sim
 
-SRCS = src/main.c src/container.c src/logger.c
+SRCS = src/main.c src/container.c src/logger.c src/namespace.c src/filesystem.c
 OBJS = $(SRCS:.c=.o)
 
 all: $(TARGET)

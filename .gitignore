@@ -4,6 +4,8 @@ container-sim
 
 # runtime output
 container.log
+containers.meta
+rootfs/
 /tmp/container-sim/
 
 # editor

@@ -8,8 +8,8 @@
 static void print_banner(void) {
     printf("╔══════════════════════════════════════════════════════╗\n");
     printf("║         Container Internals Simulator                ║\n");
-    printf("║         Module 2: Container Manager                  ║\n");
-    printf("║         Lifecycle: create start stop delete          ║\n");
+    printf("║         Module 4: Filesystem Isolation               ║\n");
+    printf("║         Namespaces + pivot_root + /proc              ║\n");
     printf("╚══════════════════════════════════════════════════════╝\n\n");
 }
 
@@ -28,7 +28,7 @@ static int parse_command(char *line, char **args, int max_args) {
 static void print_help(void) {
     printf("Commands:\n");
     printf("  create [name] [hostname] [rootfs]\n");
-    printf("  start <id>\n");
+    printf("  start <id>   (starts with namespaces and isolated rootfs)\n");
     printf("  stop <id>\n");
     printf("  delete <id>\n");
     printf("  list\n");

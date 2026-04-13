@@ -1,5 +1,4 @@
 #include <errno.h>
-#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,7 +7,9 @@
 #include <unistd.h>
 
 #include "container.h"
+#include "filesystem.h"
 #include "logger.h"
+#include "namespace.h"
 
 #define STACK_SIZE (1024 * 1024)
 #define METADATA_FILE "containers.meta"
@@ -17,14 +18,6 @@
 static Container *head = NULL;
 static Container *tail = NULL;
 static int next_sequence = 1;
-
-static int container_child(void *arg) {
-    (void)arg;
-    while (1) {
-        sleep(1);
-    }
-    return 0;
-}
 
 static const char *state_to_string(ContainerState state) {
     switch (state) {
@@ -251,7 +244,7 @@ static int stop_container_process(Container *container, int quiet) {
     return 0;
 }
 
-static void print_container_banner(const Container *container) {
+static void print_container_banner(const Container *container, pid_t namespace_pid) {
     char pid_text[16];
 
     if (container->pid > 0) {
@@ -266,7 +259,21 @@ static void print_container_banner(const Container *container) {
     printf("  pid      : %s\n", pid_text);
     printf("  hostname : %s\n", container->hostname);
     printf("  rootfs   : %s\n", container->rootfs);
+    printf("  isolate  : %s\n", namespace_profile());
+    printf("  fs mode  : %s\n", filesystem_profile());
+    if (namespace_pid > 0) {
+        printf("  ns pid   : %d\n", (int)namespace_pid);
+    }
     printf("  state    : %s\n\n", state_to_string(container->state));
+}
+
+static void print_start_error(const Container *container, int error_number) {
+    char message[256];
+
+    namespace_format_start_error(error_number, message, sizeof(message));
+    printf("[error] failed to start %s with isolation setup\n", container->id);
+    printf("[hint] rootfs: %s\n", container->rootfs);
+    printf("[hint] %s\n\n", message);
 }
 
 int container_manager_init(void) {
@@ -335,6 +342,8 @@ int container_manager_init(void) {
 
 int container_create(const ContainerSpec *spec, char *out_id, size_t out_id_size) {
     Container *container = calloc(1, sizeof(*container));
+    char requested_rootfs[CONTAINER_ROOTFS_LEN];
+    int saved_errno = 0;
 
     if (container == NULL) {
         printf("[error] out of memory\n\n");
@@ -356,9 +365,17 @@ int container_create(const ContainerSpec *spec, char *out_id, size_t out_id_size
     }
 
     if (spec != NULL && spec->rootfs != NULL && spec->rootfs[0] != '\0') {
-        copy_string(container->rootfs, sizeof(container->rootfs), spec->rootfs);
+        copy_string(requested_rootfs, sizeof(requested_rootfs), spec->rootfs);
     } else {
-        snprintf(container->rootfs, sizeof(container->rootfs), "./rootfs/%s", container->id);
+        snprintf(requested_rootfs, sizeof(requested_rootfs), "./rootfs/%s", container->id);
+    }
+
+    if (filesystem_prepare_rootfs(requested_rootfs, container->rootfs, sizeof(container->rootfs)) != 0) {
+        saved_errno = errno;
+        printf("[error] failed to prepare rootfs for %s\n", container->id);
+        printf("[hint] %s\n\n", strerror(saved_errno));
+        free(container);
+        return -1;
     }
 
     container->pid = -1;
@@ -376,7 +393,7 @@ int container_create(const ContainerSpec *spec, char *out_id, size_t out_id_size
     }
 
     printf("[manager] created %s\n", container->id);
-    print_container_banner(container);
+    print_container_banner(container, -1);
     log_event("%s CREATED (name=%s hostname=%s rootfs=%s)",
               container->id,
               container->name,
@@ -387,8 +404,9 @@ int container_create(const ContainerSpec *spec, char *out_id, size_t out_id_size
 
 int container_start(const char *id) {
     Container *container = NULL;
-    char *stack_top = NULL;
-    pid_t pid = -1;
+    NamespaceConfig namespace_config;
+    NamespaceStartResult start_result;
+    int saved_errno = 0;
 
     if (id == NULL || id[0] == '\0') {
         printf("[error] usage: start <id>\n\n");
@@ -413,16 +431,23 @@ int container_start(const char *id) {
         return -1;
     }
 
-    stack_top = container->stack + STACK_SIZE;
-    pid = clone(container_child, stack_top, SIGCHLD, NULL);
-    if (pid < 0) {
-        printf("[error] clone() failed\n\n");
-        log_event("clone() failed for %s", container->id);
+    memset(&namespace_config, 0, sizeof(namespace_config));
+    memset(&start_result, 0, sizeof(start_result));
+    namespace_config.hostname = container->hostname;
+    namespace_config.rootfs = container->rootfs;
+
+    if (namespace_start_container(&namespace_config,
+                                  container->stack,
+                                  STACK_SIZE,
+                                  &start_result) != 0) {
+        saved_errno = errno;
+        print_start_error(container, saved_errno);
+        log_event("startup isolation failed for %s: %s", container->id, strerror(saved_errno));
         free_container_stack(container);
         return -1;
     }
 
-    container->pid = pid;
+    container->pid = start_result.host_pid;
     container->state = STATE_RUNNING;
 
     if (save_metadata() != 0) {
@@ -431,8 +456,12 @@ int container_start(const char *id) {
     }
 
     printf("[manager] started %s\n", container->id);
-    print_container_banner(container);
-    log_event("%s STARTED (pid %d)", container->id, pid);
+    print_container_banner(container, start_result.namespace_pid);
+    log_event("%s STARTED (pid %d, ns_pid %d, isolation=%s)",
+              container->id,
+              container->pid,
+              start_result.namespace_pid,
+              namespace_profile());
     return 0;
 }
 
@@ -493,6 +522,8 @@ int container_list(void) {
     poll_states();
 
     printf("\n");
+    printf("Isolation profile: %s\n", namespace_profile());
+    printf("Filesystem profile: %s\n", filesystem_profile());
     printf("%-16s %-16s %-8s %-16s %-28s %-10s\n",
            "ID",
            "NAME",
