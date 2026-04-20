@@ -27,15 +27,58 @@ static int parse_command(char *line, char **args, int max_args) {
 
 static void print_help(void) {
     printf("Commands:\n");
-    printf("  run <name> <hostname> <rootfs> <command> [args...]\n");
-    printf("  runbg <name> <hostname> <rootfs> <command> [args...]\n");
-    printf("  create [name] [hostname] [rootfs]\n");
+    printf("  run [--cpu SEC] [--mem MB] [--pids N] <name> <hostname> <rootfs> <command> [args...]\n");
+    printf("  runbg [--cpu SEC] [--mem MB] [--pids N] <name> <hostname> <rootfs> <command> [args...]\n");
+    printf("  create [--cpu SEC] [--mem MB] [--pids N] [name] [hostname] [rootfs]\n");
     printf("  start <id>   (starts with namespaces and isolated rootfs)\n");
     printf("  stop <id>\n");
     printf("  delete <id>\n");
     printf("  list\n");
     printf("  help\n");
     printf("  exit\n\n");
+}
+
+static int parse_limit_flags(char **args, int argc, int *index, ResourceConfig *limits) {
+    if (args == NULL || index == NULL || limits == NULL) {
+        return -1;
+    }
+
+    while (*index < argc) {
+        const char *flag = args[*index];
+
+        if (flag == NULL || strncmp(flag, "--", 2) != 0) {
+            break;
+        }
+
+        if (strcmp(flag, "--cpu") == 0) {
+            if (*index + 1 >= argc) {
+                return -1;
+            }
+            limits->cpu_seconds = (unsigned int)strtoul(args[*index + 1], NULL, 10);
+            *index += 2;
+            continue;
+        }
+        if (strcmp(flag, "--mem") == 0) {
+            if (*index + 1 >= argc) {
+                return -1;
+            }
+            limits->memory_mb = (unsigned int)strtoul(args[*index + 1], NULL, 10);
+            *index += 2;
+            continue;
+        }
+        if (strcmp(flag, "--pids") == 0) {
+            if (*index + 1 >= argc) {
+                return -1;
+            }
+            limits->max_processes = (unsigned int)strtoul(args[*index + 1], NULL, 10);
+            *index += 2;
+            continue;
+        }
+
+        return -1;
+    }
+
+    return 0;
 }
 
 int main(void) {
@@ -79,22 +122,30 @@ int main(void) {
             char container_id[CONTAINER_ID_LEN];
             int background = (strcmp(args[0], "runbg") == 0);
             size_t offset = 0;
+            int index = 1;
 
-            if (argc < 5) {
-                printf("[error] usage: %s <name> <hostname> <rootfs> <command> [args...]\n\n", args[0]);
+            if (parse_limit_flags(args, argc, &index, &spec.resource_limits) != 0) {
+                printf("[error] usage: %s [--cpu SEC] [--mem MB] [--pids N] <name> <hostname> <rootfs> <command> [args...]\n\n",
+                       args[0]);
                 continue;
             }
 
-            spec.name = args[1];
-            spec.hostname = args[2];
-            spec.rootfs = args[3];
+            if (argc - index < 4) {
+                printf("[error] usage: %s [--cpu SEC] [--mem MB] [--pids N] <name> <hostname> <rootfs> <command> [args...]\n\n",
+                       args[0]);
+                continue;
+            }
+
+            spec.name = args[index + 0];
+            spec.hostname = args[index + 1];
+            spec.rootfs = args[index + 2];
 
             command_line[0] = '\0';
-            for (int i = 4; i < argc; i++) {
+            for (int i = index + 3; i < argc; i++) {
                 int written = snprintf(command_line + offset,
                                        sizeof(command_line) - offset,
                                        "%s%s",
-                                       (i == 4) ? "" : " ",
+                                       (i == index + 3) ? "" : " ",
                                        args[i]);
                 if (written < 0 || (size_t)written >= sizeof(command_line) - offset) {
                     offset = sizeof(command_line);
@@ -121,15 +172,21 @@ int main(void) {
         } else if (strcmp(args[0], "create") == 0) {
             ContainerSpec spec = {0};
             char container_id[CONTAINER_ID_LEN];
+            int index = 1;
 
-            if (argc > 4) {
-                printf("[error] usage: create [name] [hostname] [rootfs]\n\n");
+            if (parse_limit_flags(args, argc, &index, &spec.resource_limits) != 0) {
+                printf("[error] usage: create [--cpu SEC] [--mem MB] [--pids N] [name] [hostname] [rootfs]\n\n");
                 continue;
             }
 
-            spec.name = (argc >= 2) ? args[1] : NULL;
-            spec.hostname = (argc >= 3) ? args[2] : NULL;
-            spec.rootfs = (argc >= 4) ? args[3] : NULL;
+            if (argc - index > 3) {
+                printf("[error] usage: create [--cpu SEC] [--mem MB] [--pids N] [name] [hostname] [rootfs]\n\n");
+                continue;
+            }
+
+            spec.name = (argc - index >= 1) ? args[index + 0] : NULL;
+            spec.hostname = (argc - index >= 2) ? args[index + 1] : NULL;
+            spec.rootfs = (argc - index >= 3) ? args[index + 2] : NULL;
             spec.command_line = NULL;
 
             if (container_create(&spec, container_id, sizeof(container_id)) == 0) {

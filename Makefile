@@ -1,11 +1,14 @@
 CC     = gcc
 CFLAGS = -Wall -g -D_GNU_SOURCE
 TARGET = container-sim
+BIN_DIR = bin
 
 SRCS = src/main.c src/container.c src/logger.c src/namespace.c src/filesystem.c src/resource.c
 OBJS = $(SRCS:.c=.o)
 
-all: $(TARGET)
+WORKLOADS = $(BIN_DIR)/workload-cpu $(BIN_DIR)/workload-mem $(BIN_DIR)/workload-fork
+
+all: $(TARGET) workloads
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
@@ -13,7 +16,21 @@ $(TARGET): $(OBJS)
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-clean:
-	rm -f src/*.o $(TARGET)
+workloads: $(WORKLOADS)
 
-.PHONY: all clean
+$(BIN_DIR):
+	mkdir -p $(BIN_DIR)
+
+$(BIN_DIR)/workload-cpu: src/workload_cpu.c | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $<
+
+$(BIN_DIR)/workload-mem: src/workload_mem.c | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $<
+
+$(BIN_DIR)/workload-fork: src/workload_fork.c | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $<
+
+clean:
+	rm -f src/*.o $(TARGET) $(WORKLOADS)
+
+.PHONY: all clean workloads

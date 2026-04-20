@@ -1,6 +1,7 @@
 # build artifacts
 src/*.o
 container-sim
+bin/
 
 # runtime output
 container.log

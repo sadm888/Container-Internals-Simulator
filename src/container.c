@@ -169,6 +169,23 @@ static int is_pid_alive(pid_t pid) {
     return errno == EPERM;
 }
 
+static void format_wait_status(int status, char *buffer, size_t buffer_size) {
+    if (buffer == NULL || buffer_size == 0) {
+        return;
+    }
+
+    if (WIFEXITED(status)) {
+        snprintf(buffer, buffer_size, "exited code=%d", WEXITSTATUS(status));
+        return;
+    }
+    if (WIFSIGNALED(status)) {
+        snprintf(buffer, buffer_size, "killed signal=%d", WTERMSIG(status));
+        return;
+    }
+
+    snprintf(buffer, buffer_size, "status=%d", status);
+}
+
 static int sync_container_state(Container *container) {
     int state_changed = 0;
     int status = 0;
@@ -180,10 +197,13 @@ static int sync_container_state(Container *container) {
 
     result = waitpid(container->pid, &status, WNOHANG);
     if (result > 0) {
+        char reason[64];
+
         container->state = STATE_STOPPED;
         container->pid = -1;
         free_container_stack(container);
-        log_event("%s exited and was reaped by manager", container->id);
+        format_wait_status(status, reason, sizeof(reason));
+        log_event("%s exited and was reaped by manager (%s)", container->id, reason);
         return 1;
     }
 
@@ -214,40 +234,9 @@ static void poll_states(void) {
     }
 }
 
-static void apply_default_resource_limits(ResourceConfig *limits) {
-    if (limits == NULL) {
-        return;
-    }
-
-    limits->cpu_seconds = DEFAULT_CPU_LIMIT_SECONDS;
-    limits->memory_mb = DEFAULT_MEMORY_LIMIT_MB;
-    limits->max_processes = DEFAULT_PROCESS_LIMIT;
-}
-
 static int normalize_resource_limits(ResourceConfig *limits) {
     if (limits == NULL) {
         return -1;
-    }
-
-    if (limits->cpu_seconds == 0) {
-        limits->cpu_seconds = DEFAULT_CPU_LIMIT_SECONDS;
-    }
-    if (limits->memory_mb == 0) {
-        limits->memory_mb = DEFAULT_MEMORY_LIMIT_MB;
-    }
-    if (limits->max_processes == 0) {
-        limits->max_processes = DEFAULT_PROCESS_LIMIT;
-    }
-
-    /* Guardrails against garbage/uninitialized values. */
-    if (limits->cpu_seconds > 24U * 60U * 60U) {
-        limits->cpu_seconds = DEFAULT_CPU_LIMIT_SECONDS;
-    }
-    if (limits->memory_mb > 4096U) {
-        limits->memory_mb = DEFAULT_MEMORY_LIMIT_MB;
-    }
-    if (limits->max_processes > 4096U) {
-        limits->max_processes = DEFAULT_PROCESS_LIMIT;
     }
 
     return 0;
@@ -297,6 +286,7 @@ static int move_terminal_foreground(pid_t pgrp) {
 
 static int wait_for_container_process(Container *container, int quiet) {
     int status = 0;
+    char reason[64];
     pid_t shell_pgrp = getpgrp();
     int terminal_moved = 0;
 
@@ -324,7 +314,8 @@ static int wait_for_container_process(Container *container, int quiet) {
         (void)move_terminal_foreground(shell_pgrp);
     }
 
-    log_event("%s exited with status %d", container->id, status);
+    format_wait_status(status, reason, sizeof(reason));
+    log_event("%s finished (%s)", container->id, reason);
     container->pid = -1;
     container->state = STATE_STOPPED;
     free_container_stack(container);
@@ -467,7 +458,7 @@ int container_manager_init(void) {
             container->resource_limits.memory_mb = (unsigned int)strtoul(fields[8], NULL, 10);
             container->resource_limits.max_processes = (unsigned int)strtoul(fields[9], NULL, 10);
         } else {
-            apply_default_resource_limits(&container->resource_limits);
+            memset(&container->resource_limits, 0, sizeof(container->resource_limits));
         }
         (void)normalize_resource_limits(&container->resource_limits);
         container->stack = NULL;
@@ -531,11 +522,10 @@ int container_create(const ContainerSpec *spec, char *out_id, size_t out_id_size
         copy_string(container->command_line, sizeof(container->command_line), DEFAULT_CONTAINER_COMMAND);
     }
 
-    apply_default_resource_limits(&container->resource_limits);
+    memset(&container->resource_limits, 0, sizeof(container->resource_limits));
     if (spec != NULL) {
-        ResourceConfig requested = spec->resource_limits;
-        (void)normalize_resource_limits(&requested);
-        container->resource_limits = requested;
+        container->resource_limits = spec->resource_limits;
+        (void)normalize_resource_limits(&container->resource_limits);
     }
 
     if (filesystem_prepare_rootfs(requested_rootfs, container->rootfs, sizeof(container->rootfs)) != 0) {

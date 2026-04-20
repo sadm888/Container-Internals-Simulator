@@ -22,7 +22,19 @@ static const char *bootstrap_binaries[] = {
     "/bin/sleep"
 };
 
+typedef struct {
+    const char *host_relative;
+    const char *container_path;
+} BootstrapWorkload;
+
+static const BootstrapWorkload bootstrap_workloads[] = {
+    {"./bin/workload-cpu",  "/bin/workload-cpu"},
+    {"./bin/workload-mem",  "/bin/workload-mem"},
+    {"./bin/workload-fork", "/bin/workload-fork"}
+};
+
 static int path_dirname(const char *path, char *buffer, size_t buffer_size);
+static int copy_binary_dependencies(const char *rootfs, const char *binary_path);
 
 static int ensure_directory(const char *path, mode_t mode) {
     struct stat st;
@@ -329,6 +341,66 @@ static int copy_path_into_rootfs(const char *rootfs, const char *host_path) {
     return copy_regular_file(host_path, destination);
 }
 
+static int copy_host_binary_to_container_path(const char *rootfs, const char *host_binary, const char *container_path) {
+    char destination[PATH_MAX];
+    char destination_dir[PATH_MAX];
+    struct stat st;
+
+    if (rootfs == NULL || host_binary == NULL || container_path == NULL || container_path[0] != '/') {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (lstat(host_binary, &st) != 0) {
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (snprintf(destination, sizeof(destination), "%s%s", rootfs, container_path) >= (int)sizeof(destination)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    if (path_dirname(destination, destination_dir, sizeof(destination_dir)) != 0) {
+        return -1;
+    }
+    if (mkdir_p(destination_dir, 0755) != 0) {
+        return -1;
+    }
+
+    if (copy_regular_file(host_binary, destination) != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int bootstrap_rootfs_workloads(const char *rootfs) {
+    for (size_t i = 0; i < sizeof(bootstrap_workloads) / sizeof(bootstrap_workloads[0]); i++) {
+        char host_abs[PATH_MAX];
+
+        if (realpath(bootstrap_workloads[i].host_relative, host_abs) == NULL) {
+            if (errno == ENOENT) {
+                continue;
+            }
+            return -1;
+        }
+
+        if (copy_host_binary_to_container_path(rootfs, host_abs, bootstrap_workloads[i].container_path) != 0) {
+            return -1;
+        }
+
+        if (copy_binary_dependencies(rootfs, host_abs) != 0) {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
 static int parse_ldd_dependency(const char *line, char *path, size_t path_size) {
     const char *start = NULL;
     const char *end = NULL;
@@ -524,6 +596,9 @@ int filesystem_prepare_rootfs(const char *requested_rootfs,
     }
 
     if (bootstrap_rootfs_tools(absolute_rootfs) != 0) {
+        return -1;
+    }
+    if (bootstrap_rootfs_workloads(absolute_rootfs) != 0) {
         return -1;
     }
 
