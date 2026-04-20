@@ -1,3 +1,5 @@
+#include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,11 +8,16 @@
 #include "logger.h"
 #include "scheduler.h"
 
+static void on_sigint(int sig) {
+    (void)sig;
+    container_request_interrupt();
+}
+
 static void print_banner(void) {
     printf("╔══════════════════════════════════════════════════════╗\n");
     printf("║         Container Internals Simulator                ║\n");
-    printf("║         Module 4: Filesystem Isolation               ║\n");
-    printf("║         Namespaces + pivot_root + /proc              ║\n");
+    printf("║         Modules 1-8: Runtime + Monitoring            ║\n");
+    printf("║         NS | FS | Limits | Sched | Netns | Stats     ║\n");
     printf("╚══════════════════════════════════════════════════════╝\n\n");
 }
 
@@ -38,6 +45,10 @@ static void print_help(void) {
     printf("  stop <id>\n");
     printf("  delete <id>\n");
     printf("  list\n");
+    printf("  stats                 (shows stats for all running containers)\n");
+    printf("  stats <id>\n");
+    printf("  stats --watch <sec>   (live stats for all running containers)\n");
+    printf("  stats --watch <sec> <id>\n");
     printf("  help\n");
     printf("  exit\n\n");
 }
@@ -88,6 +99,8 @@ static int parse_limit_flags(char **args, int argc, int *index, ResourceConfig *
 int main(void) {
     char line[256];
 
+    (void)signal(SIGINT, on_sigint);
+
     if (container_manager_init() != 0) {
         return 1;
     }
@@ -104,6 +117,11 @@ int main(void) {
         fflush(stdout);
 
         if (fgets(line, sizeof(line), stdin) == NULL) {
+            if (errno == EINTR || container_consume_interrupt()) {
+                clearerr(stdin);
+                printf("\n");
+                continue;
+            }
             printf("\n");
             cleanup_all_containers();
             log_event("=== simulator stopped ===");
@@ -267,6 +285,20 @@ int main(void) {
                 continue;
             }
             container_list();
+        } else if (strcmp(args[0], "stats") == 0) {
+            if (argc == 1) {
+                container_stats_all();
+            } else if (argc == 2) {
+                container_stats(args[1]);
+            } else if (argc == 3 && strcmp(args[1], "--watch") == 0) {
+                unsigned int sec = (unsigned int)strtoul(args[2], NULL, 10);
+                container_stats_all_watch(sec);
+            } else if (argc == 4 && strcmp(args[1], "--watch") == 0) {
+                unsigned int sec = (unsigned int)strtoul(args[2], NULL, 10);
+                container_stats_watch(args[3], sec);
+            } else {
+                printf("[error] usage: stats [id] | stats --watch <sec> [id]\n\n");
+            }
         } else if (strcmp(args[0], "help") == 0) {
             print_help();
         } else if (strcmp(args[0], "exit") == 0) {

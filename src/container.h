@@ -54,4 +54,14 @@ void container_scheduler_refresh_targets(void);
 void container_scheduler_on_started(pid_t pid);
 void container_scheduler_on_stopped(pid_t pid);
 
+/* Monitoring (Module 8). */
+int container_stats(const char *id);
+int container_stats_all(void);
+int container_stats_watch(const char *id, unsigned int interval_sec);
+int container_stats_all_watch(unsigned int interval_sec);
+
+/* Ctrl+C handling for watch loops / CLI. */
+void container_request_interrupt(void);
+int container_consume_interrupt(void);
+
 #endif

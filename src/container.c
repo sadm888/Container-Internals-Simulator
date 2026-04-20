@@ -5,11 +5,13 @@
 #include <string.h>
 #include <termios.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "container.h"
 #include "filesystem.h"
 #include "logger.h"
+#include "monitor.h"
 #include "network.h"
 #include "namespace.h"
 #include "resource.h"
@@ -23,6 +25,19 @@
 static Container *head = NULL;
 static Container *tail = NULL;
 static int next_sequence = 1;
+static volatile sig_atomic_t g_interrupt_requested = 0;
+
+void container_request_interrupt(void) {
+    g_interrupt_requested = 1;
+}
+
+int container_consume_interrupt(void) {
+    if (g_interrupt_requested) {
+        g_interrupt_requested = 0;
+        return 1;
+    }
+    return 0;
+}
 
 static const char *state_to_string(ContainerState state) {
     switch (state) {
@@ -834,6 +849,306 @@ int container_list(void) {
 
     printf("\n");
     return 0;
+}
+
+static void print_stats_header(void) {
+    printf("\n");
+    printf("Monitor profile: %s\n", monitor_profile());
+    printf("%-16s %-8s %-6s %-10s %-8s %-10s %-10s %-6s %-24s\n",
+           "ID",
+           "PID",
+           "STATE",
+           "CPU(s)",
+           "CPU(%)",
+           "RSS(MB)",
+           "VSZ(MB)",
+           "THR",
+           "COMMAND");
+    printf("---------------------------------------------------------------------------------------------------------------\n");
+}
+
+static void print_stats_row(const Container *container, const MonitorStats *stats, int has_cpu_pct, double cpu_pct) {
+    double rss_mb = 0.0;
+    double vsize_mb = 0.0;
+    char state_text[8];
+    char cpu_pct_text[16];
+
+    if (container == NULL || stats == NULL) {
+        return;
+    }
+
+    rss_mb = (double)stats->rss_bytes / (1024.0 * 1024.0);
+    vsize_mb = (double)stats->vsize_bytes / (1024.0 * 1024.0);
+    snprintf(state_text, sizeof(state_text), "%c", stats->state);
+
+    if (!has_cpu_pct) {
+        snprintf(cpu_pct_text, sizeof(cpu_pct_text), "-");
+    } else {
+        snprintf(cpu_pct_text, sizeof(cpu_pct_text), "%.1f", cpu_pct);
+    }
+
+    printf("%-16s %-8d %-6s %-10.2f %-8s %-10.1f %-10.1f %-6ld %-24s\n",
+           container->id,
+           (int)stats->pid,
+           state_text,
+           stats->cpu_seconds,
+           cpu_pct_text,
+           rss_mb,
+           vsize_mb,
+           stats->threads,
+           container->command_line);
+}
+
+int container_stats(const char *id) {
+    Container *container = NULL;
+    MonitorStats stats;
+
+    if (id == NULL || id[0] == '\0') {
+        printf("[error] usage: stats <id>\n\n");
+        return -1;
+    }
+
+    poll_states();
+    container = find_container(id);
+    if (container == NULL) {
+        printf("[error] container %s not found\n\n", id);
+        return -1;
+    }
+
+    if (container->state != STATE_RUNNING || container->pid <= 0) {
+        printf("[manager] %s is not running\n\n", container->id);
+        return -1;
+    }
+
+    if (monitor_read(container->pid, &stats) != 0) {
+        printf("[error] failed to read stats for %s (pid %d)\n\n", container->id, (int)container->pid);
+        return -1;
+    }
+
+    print_stats_header();
+    print_stats_row(container, &stats, 0, 0.0);
+    printf("\n");
+    return 0;
+}
+
+int container_stats_all(void) {
+    int any = 0;
+
+    poll_states();
+    print_stats_header();
+
+    for (Container *cursor = head; cursor != NULL; cursor = cursor->next) {
+        MonitorStats stats;
+
+        if (cursor->state != STATE_RUNNING || cursor->pid <= 0) {
+            continue;
+        }
+
+        if (monitor_read(cursor->pid, &stats) != 0) {
+            continue;
+        }
+
+        print_stats_row(cursor, &stats, 0, 0.0);
+        any = 1;
+    }
+
+    if (!any) {
+        printf("no running containers\n");
+    }
+
+    printf("\n");
+    return 0;
+}
+
+typedef struct {
+    pid_t pid;
+    double cpu_seconds;
+    unsigned long long wall_ns;
+} CpuSample;
+
+static unsigned long long monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ULL + (unsigned long long)ts.tv_nsec;
+}
+
+static int find_sample(CpuSample *samples, size_t count, pid_t pid) {
+    for (size_t i = 0; i < count; i++) {
+        if (samples[i].pid == pid) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static void sleep_interval(unsigned int interval_sec) {
+    struct timespec ts;
+    ts.tv_sec = (time_t)interval_sec;
+    ts.tv_nsec = 0;
+    while (nanosleep(&ts, &ts) != 0) {
+        if (errno == EINTR) {
+            return;
+        }
+        return;
+    }
+}
+
+static void clear_screen_if_tty(void) {
+    if (!isatty(STDOUT_FILENO)) {
+        return;
+    }
+
+    /* ANSI clear screen + cursor home. */
+    fputs("\033[H\033[J", stdout);
+}
+
+int container_stats_watch(const char *id, unsigned int interval_sec) {
+    CpuSample prev = {0};
+    int has_prev = 0;
+
+    if (interval_sec == 0) {
+        printf("[error] usage: stats --watch <sec> [id]\n\n");
+        return -1;
+    }
+
+    printf("[hint] watching every %us; press Ctrl+C to stop\n", interval_sec);
+
+    while (1) {
+        if (container_consume_interrupt()) {
+            printf("\n");
+            return 0;
+        }
+
+        Container *container = NULL;
+        MonitorStats stats;
+        unsigned long long now = 0;
+        double cpu_pct = 0.0;
+        int has_cpu_pct = 0;
+
+        poll_states();
+        container = find_container(id);
+        if (container == NULL) {
+            printf("\n[error] container %s not found\n\n", id);
+            return -1;
+        }
+
+        if (container->state != STATE_RUNNING || container->pid <= 0) {
+            printf("\n[manager] %s is not running\n\n", container->id);
+            return -1;
+        }
+
+        if (monitor_read(container->pid, &stats) != 0) {
+            printf("\n[error] failed to read stats for %s (pid %d)\n\n", container->id, (int)container->pid);
+            return -1;
+        }
+
+        now = monotonic_ns();
+        if (has_prev && prev.pid == stats.pid) {
+            double delta_cpu = stats.cpu_seconds - prev.cpu_seconds;
+            double delta_wall = (double)(now - prev.wall_ns) / 1e9;
+            if (delta_wall > 0.0 && delta_cpu >= 0.0) {
+                cpu_pct = (delta_cpu / delta_wall) * 100.0;
+                has_cpu_pct = 1;
+            }
+        }
+
+        clear_screen_if_tty();
+        printf("[watch] interval=%us (Ctrl+C to stop)\n", interval_sec);
+        print_stats_header();
+        print_stats_row(container, &stats, has_cpu_pct, cpu_pct);
+        printf("\n");
+
+        prev.pid = stats.pid;
+        prev.cpu_seconds = stats.cpu_seconds;
+        prev.wall_ns = now;
+        has_prev = 1;
+
+        sleep_interval(interval_sec);
+    }
+}
+
+int container_stats_all_watch(unsigned int interval_sec) {
+    CpuSample *prev = NULL;
+    size_t prev_count = 0;
+    size_t prev_capacity = 0;
+
+    if (interval_sec == 0) {
+        printf("[error] usage: stats --watch <sec> [id]\n\n");
+        return -1;
+    }
+
+    printf("[hint] watching every %us; press Ctrl+C to stop\n", interval_sec);
+
+    while (1) {
+        if (container_consume_interrupt()) {
+            printf("\n");
+            free(prev);
+            return 0;
+        }
+
+        unsigned long long now = monotonic_ns();
+        int any = 0;
+
+        poll_states();
+        clear_screen_if_tty();
+        printf("[watch] interval=%us (Ctrl+C to stop)\n", interval_sec);
+        print_stats_header();
+
+        for (Container *cursor = head; cursor != NULL; cursor = cursor->next) {
+            MonitorStats stats;
+            double cpu_pct = 0.0;
+            int has_cpu_pct = 0;
+            int index = -1;
+
+            if (cursor->state != STATE_RUNNING || cursor->pid <= 0) {
+                continue;
+            }
+
+            if (monitor_read(cursor->pid, &stats) != 0) {
+                continue;
+            }
+
+            index = find_sample(prev, prev_count, stats.pid);
+            if (index >= 0) {
+                double delta_cpu = stats.cpu_seconds - prev[index].cpu_seconds;
+                double delta_wall = (double)(now - prev[index].wall_ns) / 1e9;
+                if (delta_wall > 0.0 && delta_cpu >= 0.0) {
+                    cpu_pct = (delta_cpu / delta_wall) * 100.0;
+                    has_cpu_pct = 1;
+                }
+
+                prev[index].cpu_seconds = stats.cpu_seconds;
+                prev[index].wall_ns = now;
+            } else {
+                if (prev_count == prev_capacity) {
+                    size_t next_capacity = (prev_capacity == 0) ? 8 : prev_capacity * 2;
+                    CpuSample *next = realloc(prev, next_capacity * sizeof(*next));
+                    if (next == NULL) {
+                        free(prev);
+                        printf("\n[error] out of memory\n\n");
+                        return -1;
+                    }
+                    prev = next;
+                    prev_capacity = next_capacity;
+                }
+
+                prev[prev_count].pid = stats.pid;
+                prev[prev_count].cpu_seconds = stats.cpu_seconds;
+                prev[prev_count].wall_ns = now;
+                prev_count++;
+            }
+
+            print_stats_row(cursor, &stats, has_cpu_pct, cpu_pct);
+            any = 1;
+        }
+
+        if (!any) {
+            printf("no running containers\n");
+        }
+
+        printf("\n");
+        sleep_interval(interval_sec);
+    }
 }
 
 void cleanup_all_containers(void) {

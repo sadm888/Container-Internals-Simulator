@@ -3,7 +3,7 @@ CFLAGS = -Wall -g -D_GNU_SOURCE -pthread
 TARGET = container-sim
 BIN_DIR = bin
 
-SRCS = src/main.c src/container.c src/logger.c src/namespace.c src/filesystem.c src/resource.c src/scheduler.c src/network.c
+SRCS = src/main.c src/container.c src/logger.c src/namespace.c src/filesystem.c src/resource.c src/scheduler.c src/network.c src/monitor.c
 OBJS = $(SRCS:.c=.o)
 
 WORKLOADS = $(BIN_DIR)/workload-cpu $(BIN_DIR)/workload-mem $(BIN_DIR)/workload-fork $(BIN_DIR)/workload-netcheck
