@@ -27,6 +27,8 @@ static int parse_command(char *line, char **args, int max_args) {
 
 static void print_help(void) {
     printf("Commands:\n");
+    printf("  run <name> <hostname> <rootfs> <command> [args...]\n");
+    printf("  runbg <name> <hostname> <rootfs> <command> [args...]\n");
     printf("  create [name] [hostname] [rootfs]\n");
     printf("  start <id>   (starts with namespaces and isolated rootfs)\n");
     printf("  stop <id>\n");
@@ -48,7 +50,7 @@ int main(void) {
     log_event("=== simulator started ===");
 
     while (1) {
-        char *args[5] = {0};
+        char *args[32] = {0};
         int argc = 0;
 
         printf("container-sim> ");
@@ -66,12 +68,57 @@ int main(void) {
             continue;
         }
 
-        argc = parse_command(line, args, 5);
+        argc = parse_command(line, args, (int)(sizeof(args) / sizeof(args[0])));
         if (argc == 0) {
             continue;
         }
 
-        if (strcmp(args[0], "create") == 0) {
+        if (strcmp(args[0], "run") == 0 || strcmp(args[0], "runbg") == 0) {
+            ContainerSpec spec = {0};
+            char command_line[CONTAINER_COMMAND_LEN];
+            char container_id[CONTAINER_ID_LEN];
+            int background = (strcmp(args[0], "runbg") == 0);
+            size_t offset = 0;
+
+            if (argc < 5) {
+                printf("[error] usage: %s <name> <hostname> <rootfs> <command> [args...]\n\n", args[0]);
+                continue;
+            }
+
+            spec.name = args[1];
+            spec.hostname = args[2];
+            spec.rootfs = args[3];
+
+            command_line[0] = '\0';
+            for (int i = 4; i < argc; i++) {
+                int written = snprintf(command_line + offset,
+                                       sizeof(command_line) - offset,
+                                       "%s%s",
+                                       (i == 4) ? "" : " ",
+                                       args[i]);
+                if (written < 0 || (size_t)written >= sizeof(command_line) - offset) {
+                    offset = sizeof(command_line);
+                    break;
+                }
+                offset += (size_t)written;
+            }
+
+            if (offset >= sizeof(command_line)) {
+                printf("[error] command is too long\n\n");
+                continue;
+            }
+
+            spec.command_line = command_line;
+
+            if ((!background && container_run(&spec, container_id, sizeof(container_id)) == 0) ||
+                (background && container_run_background(&spec, container_id, sizeof(container_id)) == 0)) {
+                if (background) {
+                    printf("[hint] runtime workload running in background as %s\n\n", container_id);
+                } else {
+                    printf("[hint] runtime workload completed in %s\n\n", container_id);
+                }
+            }
+        } else if (strcmp(args[0], "create") == 0) {
             ContainerSpec spec = {0};
             char container_id[CONTAINER_ID_LEN];
 
@@ -83,6 +130,7 @@ int main(void) {
             spec.name = (argc >= 2) ? args[1] : NULL;
             spec.hostname = (argc >= 3) ? args[2] : NULL;
             spec.rootfs = (argc >= 4) ? args[3] : NULL;
+            spec.command_line = NULL;
 
             if (container_create(&spec, container_id, sizeof(container_id)) == 0) {
                 printf("[hint] start it with: start %s\n\n", container_id);

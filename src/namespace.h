@@ -4,11 +4,15 @@
 #include <stddef.h>
 #include <sys/types.h>
 
+#include "resource.h"
+
 #define NAMESPACE_PROFILE "PID | UTS | MOUNT | NET"
 
 typedef struct {
     const char *hostname;
     const char *rootfs;
+    const char *command_line;
+    ResourceConfig resource_limits;
 } NamespaceConfig;
 
 typedef struct {

@@ -1,6 +1,8 @@
 #include <errno.h>
+#include <fcntl.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mount.h>
@@ -10,6 +12,7 @@
 
 #include "filesystem.h"
 #include "namespace.h"
+#include "resource.h"
 
 typedef struct {
     int   ready;
@@ -20,9 +23,47 @@ typedef struct {
 typedef struct {
     const char *hostname;
     const char *rootfs;
+    const char *command_line;
+    ResourceConfig resource_limits;
     int         status_fd;
     int         continue_fd;
+    int         exec_fd;
 } NamespaceChildArgs;
+
+static int build_exec_argv(const char *command_line, char *buffer, size_t buffer_size, char **argv, int max_args) {
+    char *token = NULL;
+    int argc = 0;
+
+    if (command_line == NULL || command_line[0] == '\0' || buffer == NULL || buffer_size == 0 ||
+        argv == NULL || max_args < 2) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (snprintf(buffer, buffer_size, "%s", command_line) >= (int)buffer_size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    token = strtok(buffer, " ");
+    while (token != NULL) {
+        if (argc >= max_args - 1) {
+            errno = E2BIG;
+            return -1;
+        }
+
+        argv[argc++] = token;
+        token = strtok(NULL, " ");
+    }
+
+    if (argc == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    argv[argc] = NULL;
+    return 0;
+}
 
 static int write_text_file(const char *path, const char *content) {
     FILE *file = fopen(path, "w");
@@ -94,6 +135,9 @@ static int wait_for_parent_ready(int fd) {
 
 static int namespace_child(void *arg) {
     FilesystemConfig filesystem_config;
+    char command_buffer[256];
+    char *argv[32];
+    int exec_errno = 0;
     NamespaceChildArgs *child_args = arg;
     NamespaceStatus status;
 
@@ -141,16 +185,42 @@ static int namespace_child(void *arg) {
         }
     }
 
+    if (build_exec_argv(child_args->command_line,
+                        command_buffer,
+                        sizeof(command_buffer),
+                        argv,
+                        (int)(sizeof(argv) / sizeof(argv[0]))) != 0) {
+        status.error_number = errno;
+        (void)write(child_args->status_fd, &status, sizeof(status));
+        close(child_args->status_fd);
+        return 1;
+    }
+
+    if (resource_apply_limits(&child_args->resource_limits) != 0) {
+        status.error_number = RESOURCE_ERROR_BASE + errno;
+        (void)write(child_args->status_fd, &status, sizeof(status));
+        close(child_args->status_fd);
+        return 1;
+    }
+
+    if (setpgid(0, 0) != 0) {
+        status.error_number = errno;
+        (void)write(child_args->status_fd, &status, sizeof(status));
+        close(child_args->status_fd);
+        return 1;
+    }
+
     status.ready = 1;
     status.namespace_pid = getpid();
     (void)write(child_args->status_fd, &status, sizeof(status));
     close(child_args->status_fd);
 
-    while (1) {
-        pause();
-    }
-
-    return 0;
+    execvp(argv[0], argv);
+    exec_errno = errno;
+    (void)write(child_args->exec_fd, &exec_errno, sizeof(exec_errno));
+    close(child_args->exec_fd);
+    errno = exec_errno;
+    return 127;
 }
 
 static int read_status(int fd, NamespaceStatus *status) {
@@ -176,18 +246,54 @@ static int read_status(int fd, NamespaceStatus *status) {
     return (total_read == sizeof(*status)) ? 0 : -1;
 }
 
+static int read_exec_status(int fd, int *child_errno) {
+    ssize_t bytes_read = 0;
+
+    if (child_errno == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    while (1) {
+        bytes_read = read(fd, child_errno, sizeof(*child_errno));
+        if (bytes_read == 0) {
+            close(fd);
+            return 0;
+        }
+        if (bytes_read < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            close(fd);
+            return -1;
+        }
+        if ((size_t)bytes_read == sizeof(*child_errno)) {
+            close(fd);
+            errno = *child_errno;
+            return -1;
+        }
+
+        close(fd);
+        errno = EPROTO;
+        return -1;
+    }
+}
+
 int namespace_start_container(const NamespaceConfig *config,
                               char *stack,
                               size_t stack_size,
                               NamespaceStartResult *result) {
     NamespaceChildArgs child_args;
     NamespaceStatus status;
+    int child_errno = 0;
+    int exec_pipe[2];
     int status_pipe[2];
     int continue_pipe[2];
     int clone_flags = CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWNET | SIGCHLD;
     pid_t pid;
 
-    if (config == NULL || stack == NULL || stack_size == 0 || result == NULL) {
+    if (config == NULL || config->command_line == NULL || config->command_line[0] == '\0' ||
+        stack == NULL || stack_size == 0 || result == NULL) {
         errno = EINVAL;
         return -1;
     }
@@ -195,11 +301,31 @@ int namespace_start_container(const NamespaceConfig *config,
     if (pipe(status_pipe) != 0) {
         return -1;
     }
+    if (pipe(exec_pipe) != 0) {
+        int saved_errno = errno;
+
+        close(status_pipe[0]);
+        close(status_pipe[1]);
+        errno = saved_errno;
+        return -1;
+    }
+    if (fcntl(exec_pipe[1], F_SETFD, FD_CLOEXEC) != 0) {
+        int saved_errno = errno;
+
+        close(status_pipe[0]);
+        close(status_pipe[1]);
+        close(exec_pipe[0]);
+        close(exec_pipe[1]);
+        errno = saved_errno;
+        return -1;
+    }
     if (pipe(continue_pipe) != 0) {
         int saved_errno = errno;
 
         close(status_pipe[0]);
         close(status_pipe[1]);
+        close(exec_pipe[0]);
+        close(exec_pipe[1]);
         errno = saved_errno;
         return -1;
     }
@@ -207,8 +333,11 @@ int namespace_start_container(const NamespaceConfig *config,
     memset(&child_args, 0, sizeof(child_args));
     child_args.hostname = config->hostname;
     child_args.rootfs = config->rootfs;
+    child_args.command_line = config->command_line;
+    child_args.resource_limits = config->resource_limits;
     child_args.status_fd = status_pipe[1];
     child_args.continue_fd = continue_pipe[0];
+    child_args.exec_fd = exec_pipe[1];
 
     pid = clone(namespace_child, stack + stack_size, clone_flags, &child_args);
     if (pid < 0) {
@@ -216,12 +345,15 @@ int namespace_start_container(const NamespaceConfig *config,
 
         close(status_pipe[0]);
         close(status_pipe[1]);
+        close(exec_pipe[0]);
+        close(exec_pipe[1]);
         close(continue_pipe[0]);
         close(continue_pipe[1]);
         errno = saved_errno;
         return -1;
     }
 
+    close(exec_pipe[1]);
     close(status_pipe[1]);
     close(continue_pipe[0]);
     memset(&status, 0, sizeof(status));
@@ -232,6 +364,7 @@ int namespace_start_container(const NamespaceConfig *config,
 
         close(continue_pipe[1]);
         close(status_pipe[0]);
+        close(exec_pipe[0]);
         kill(pid, SIGKILL);
         waitpid(pid, NULL, 0);
         errno = saved_errno;
@@ -243,6 +376,7 @@ int namespace_start_container(const NamespaceConfig *config,
 
         close(continue_pipe[1]);
         close(status_pipe[0]);
+        close(exec_pipe[0]);
         kill(pid, SIGKILL);
         waitpid(pid, NULL, 0);
         errno = saved_errno;
@@ -254,12 +388,21 @@ int namespace_start_container(const NamespaceConfig *config,
         int child_errno = status.error_number;
 
         close(status_pipe[0]);
+        close(exec_pipe[0]);
         waitpid(pid, NULL, 0);
         errno = (child_errno != 0) ? child_errno : EPROTO;
         return -1;
     }
 
     close(status_pipe[0]);
+    if (read_exec_status(exec_pipe[0], &child_errno) != 0) {
+        int saved_errno = errno;
+
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+        errno = saved_errno;
+        return -1;
+    }
     result->host_pid = pid;
     result->namespace_pid = status.namespace_pid;
     return 0;
@@ -275,6 +418,12 @@ void namespace_format_start_error(int err, char *buffer, size_t buffer_size) {
     }
 
     switch (err) {
+        case RESOURCE_ERROR_BASE + EPERM:
+            resource_format_error(EPERM, buffer, buffer_size);
+            break;
+        case RESOURCE_ERROR_BASE + EINVAL:
+            resource_format_error(EINVAL, buffer, buffer_size);
+            break;
         case EPERM:
             snprintf(buffer,
                      buffer_size,
@@ -295,7 +444,12 @@ void namespace_format_start_error(int err, char *buffer, size_t buffer_size) {
                      buffer_size,
                      "namespace child exited before finishing setup");
             break;
+        case E2BIG:
+            snprintf(buffer, buffer_size, "container command has too many arguments for the current runtime");
+            break;
         case ENOENT:
+            snprintf(buffer, buffer_size, "container command was not found inside the isolated rootfs");
+            break;
         case ENOTDIR:
         case ENAMETOOLONG:
         case EBUSY:
