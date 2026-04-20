@@ -12,6 +12,7 @@
 #include "logger.h"
 #include "namespace.h"
 #include "resource.h"
+#include "scheduler.h"
 
 #define STACK_SIZE (1024 * 1024)
 #define METADATA_FILE "containers.meta"
@@ -198,10 +199,12 @@ static int sync_container_state(Container *container) {
     result = waitpid(container->pid, &status, WNOHANG);
     if (result > 0) {
         char reason[64];
+        pid_t old_pid = container->pid;
 
         container->state = STATE_STOPPED;
         container->pid = -1;
         free_container_stack(container);
+        container_scheduler_on_stopped(old_pid);
         format_wait_status(status, reason, sizeof(reason));
         log_event("%s exited and was reaped by manager (%s)", container->id, reason);
         return 1;
@@ -356,6 +359,7 @@ static int stop_container_process(Container *container, int quiet) {
     }
 
     log_event("%s STOPPED (pid %d)", container->id, container->pid);
+    container_scheduler_on_stopped(container->pid);
     container->pid = -1;
     container->state = STATE_STOPPED;
     free_container_stack(container);
@@ -564,50 +568,47 @@ int container_create(const ContainerSpec *spec, char *out_id, size_t out_id_size
     return 0;
 }
 
-int container_run(const ContainerSpec *spec, char *out_id, size_t out_id_size) {
-    char container_id[CONTAINER_ID_LEN];
-    Container *container = NULL;
-
-    if (container_create(spec, container_id, sizeof(container_id)) != 0) {
-        return -1;
-    }
-
-    if (container_start(container_id) != 0) {
-        return -1;
-    }
-
-    if (out_id != NULL && out_id_size > 0) {
-        copy_string(out_id, out_id_size, container_id);
-    }
-
-    container = find_container(container_id);
-    if (container == NULL) {
-        errno = ESRCH;
-        return -1;
-    }
-
-    return wait_for_container_process(container, 0);
+void container_scheduler_on_started(pid_t pid) {
+    (void)scheduler_add_target(pid);
 }
 
-int container_run_background(const ContainerSpec *spec, char *out_id, size_t out_id_size) {
-    char container_id[CONTAINER_ID_LEN];
-
-    if (container_create(spec, container_id, sizeof(container_id)) != 0) {
-        return -1;
-    }
-
-    if (container_start(container_id) != 0) {
-        return -1;
-    }
-
-    if (out_id != NULL && out_id_size > 0) {
-        copy_string(out_id, out_id_size, container_id);
-    }
-
-    return 0;
+void container_scheduler_on_stopped(pid_t pid) {
+    (void)scheduler_remove_target(pid);
 }
 
-int container_start(const char *id) {
+void container_scheduler_refresh_targets(void) {
+    pid_t first = -1;
+    int enabled = scheduler_is_enabled();
+
+    scheduler_clear_targets();
+    for (Container *cursor = head; cursor != NULL; cursor = cursor->next) {
+        if (cursor->state == STATE_RUNNING && cursor->pid > 0) {
+            if (first < 0) {
+                first = cursor->pid;
+            }
+            (void)scheduler_add_target(cursor->pid);
+        }
+    }
+
+    if (enabled && first > 0) {
+        /* Start RR from a stable point: stop others and resume the first. */
+        for (Container *cursor = head; cursor != NULL; cursor = cursor->next) {
+            if (cursor->state == STATE_RUNNING && cursor->pid > 0 && cursor->pid != first) {
+                (void)kill(cursor->pid, SIGSTOP);
+            }
+        }
+        (void)kill(first, SIGCONT);
+    } else if (!enabled) {
+        /* Make sure no container is left paused when scheduling is off. */
+        for (Container *cursor = head; cursor != NULL; cursor = cursor->next) {
+            if (cursor->state == STATE_RUNNING && cursor->pid > 0) {
+                (void)kill(cursor->pid, SIGCONT);
+            }
+        }
+    }
+}
+
+static int start_container_by_id(const char *id, int schedule_target) {
     Container *container = NULL;
     NamespaceConfig namespace_config;
     NamespaceStartResult start_result;
@@ -676,7 +677,59 @@ int container_start(const char *id) {
               container->resource_limits.cpu_seconds,
               container->resource_limits.memory_mb,
               container->resource_limits.max_processes);
+
+    if (schedule_target) {
+        container_scheduler_on_started(container->pid);
+    }
+
     return 0;
+}
+
+int container_run(const ContainerSpec *spec, char *out_id, size_t out_id_size) {
+    char container_id[CONTAINER_ID_LEN];
+    Container *container = NULL;
+
+    if (container_create(spec, container_id, sizeof(container_id)) != 0) {
+        return -1;
+    }
+
+    if (start_container_by_id(container_id, 0) != 0) {
+        return -1;
+    }
+
+    if (out_id != NULL && out_id_size > 0) {
+        copy_string(out_id, out_id_size, container_id);
+    }
+
+    container = find_container(container_id);
+    if (container == NULL) {
+        errno = ESRCH;
+        return -1;
+    }
+
+    return wait_for_container_process(container, 0);
+}
+
+int container_run_background(const ContainerSpec *spec, char *out_id, size_t out_id_size) {
+    char container_id[CONTAINER_ID_LEN];
+
+    if (container_create(spec, container_id, sizeof(container_id)) != 0) {
+        return -1;
+    }
+
+    if (start_container_by_id(container_id, 1) != 0) {
+        return -1;
+    }
+
+    if (out_id != NULL && out_id_size > 0) {
+        copy_string(out_id, out_id_size, container_id);
+    }
+
+    return 0;
+}
+
+int container_start(const char *id) {
+    return start_container_by_id(id, 1);
 }
 
 int container_stop(const char *id) {
@@ -805,4 +858,6 @@ void cleanup_all_containers(void) {
 
     head = NULL;
     tail = NULL;
+
+    scheduler_stop();
 }

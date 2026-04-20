@@ -4,6 +4,7 @@
 
 #include "container.h"
 #include "logger.h"
+#include "scheduler.h"
 
 static void print_banner(void) {
     printf("╔══════════════════════════════════════════════════════╗\n");
@@ -30,6 +31,9 @@ static void print_help(void) {
     printf("  run [--cpu SEC] [--mem MB] [--pids N] <name> <hostname> <rootfs> <command> [args...]\n");
     printf("  runbg [--cpu SEC] [--mem MB] [--pids N] <name> <hostname> <rootfs> <command> [args...]\n");
     printf("  create [--cpu SEC] [--mem MB] [--pids N] [name] [hostname] [rootfs]\n");
+    printf("  sched on|off\n");
+    printf("  sched slice <ms>\n");
+    printf("  sched status\n");
     printf("  start <id>   (starts with namespaces and isolated rootfs)\n");
     printf("  stop <id>\n");
     printf("  delete <id>\n");
@@ -191,6 +195,53 @@ int main(void) {
 
             if (container_create(&spec, container_id, sizeof(container_id)) == 0) {
                 printf("[hint] start it with: start %s\n\n", container_id);
+            }
+        } else if (strcmp(args[0], "sched") == 0) {
+            if (argc < 2) {
+                printf("[error] usage: sched on|off|slice <ms>|status\n\n");
+                continue;
+            }
+
+            if (strcmp(args[1], "on") == 0) {
+                SchedulerConfig config = {0};
+
+                config.time_slice_ms = scheduler_get_time_slice_ms();
+                if (config.time_slice_ms == 0) {
+                    config.time_slice_ms = 200;
+                }
+
+                if (scheduler_start(&config) != 0) {
+                    printf("[error] failed to start scheduler\n\n");
+                    continue;
+                }
+                scheduler_set_enabled(1);
+                container_scheduler_refresh_targets();
+                printf("[manager] scheduler enabled (%s, slice=%ums)\n\n",
+                       scheduler_profile(),
+                       scheduler_get_time_slice_ms());
+            } else if (strcmp(args[1], "off") == 0) {
+                scheduler_set_enabled(0);
+                container_scheduler_refresh_targets();
+                printf("[manager] scheduler disabled\n\n");
+            } else if (strcmp(args[1], "slice") == 0) {
+                unsigned int ms = 0;
+                if (argc != 3) {
+                    printf("[error] usage: sched slice <ms>\n\n");
+                    continue;
+                }
+                ms = (unsigned int)strtoul(args[2], NULL, 10);
+                if (scheduler_set_time_slice_ms(ms) != 0) {
+                    printf("[error] invalid time slice\n\n");
+                    continue;
+                }
+                printf("[manager] scheduler slice set to %ums\n\n", scheduler_get_time_slice_ms());
+            } else if (strcmp(args[1], "status") == 0) {
+                printf("[manager] scheduler: %s, slice=%ums, mode=%s\n\n",
+                       scheduler_profile(),
+                       scheduler_get_time_slice_ms(),
+                       scheduler_is_enabled() ? "enabled" : "disabled");
+            } else {
+                printf("[error] usage: sched on|off|slice <ms>|status\n\n");
             }
         } else if (strcmp(args[0], "start") == 0) {
             if (argc != 2) {

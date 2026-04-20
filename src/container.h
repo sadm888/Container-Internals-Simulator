@@ -49,4 +49,9 @@ int  container_delete(const char *id);
 int  container_list(void);
 void cleanup_all_containers(void);
 
+/* Scheduler integration (Module 6). */
+void container_scheduler_refresh_targets(void);
+void container_scheduler_on_started(pid_t pid);
+void container_scheduler_on_stopped(pid_t pid);
+
 #endif
