@@ -30,7 +30,8 @@ typedef struct {
 static const BootstrapWorkload bootstrap_workloads[] = {
     {"./bin/workload-cpu",  "/bin/workload-cpu"},
     {"./bin/workload-mem",  "/bin/workload-mem"},
-    {"./bin/workload-fork", "/bin/workload-fork"}
+    {"./bin/workload-fork", "/bin/workload-fork"},
+    {"./bin/workload-netcheck", "/bin/workload-netcheck"}
 };
 
 static int path_dirname(const char *path, char *buffer, size_t buffer_size);

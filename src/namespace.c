@@ -12,6 +12,7 @@
 
 #include "filesystem.h"
 #include "namespace.h"
+#include "network.h"
 #include "resource.h"
 
 typedef struct {
@@ -178,6 +179,16 @@ static int namespace_child(void *arg) {
 
     if (mount(NULL, "/proc", NULL, MS_REMOUNT | MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL) != 0) {
         if (errno != EINVAL) {
+            status.error_number = errno;
+            (void)write(child_args->status_fd, &status, sizeof(status));
+            close(child_args->status_fd);
+            return 1;
+        }
+    }
+
+    if (network_setup_loopback() != 0) {
+        /* Best-effort for WSL/host restrictions. */
+        if (errno != EPERM) {
             status.error_number = errno;
             (void)write(child_args->status_fd, &status, sizeof(status));
             close(child_args->status_fd);

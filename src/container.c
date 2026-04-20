@@ -10,6 +10,7 @@
 #include "container.h"
 #include "filesystem.h"
 #include "logger.h"
+#include "network.h"
 #include "namespace.h"
 #include "resource.h"
 #include "scheduler.h"
@@ -393,6 +394,7 @@ static void print_container_banner(const Container *container, pid_t namespace_p
     printf("  limits   : %s\n", limits_text);
     printf("  isolate  : %s\n", namespace_profile());
     printf("  fs mode  : %s\n", filesystem_profile());
+    printf("  net mode : %s\n", network_profile());
     printf("  res mode : %s\n", resource_profile());
     if (namespace_pid > 0) {
         printf("  ns pid   : %d\n", (int)namespace_pid);
