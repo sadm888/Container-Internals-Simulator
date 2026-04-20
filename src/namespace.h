@@ -13,6 +13,7 @@ typedef struct {
     const char *rootfs;
     const char *command_line;
     ResourceConfig resource_limits;
+    int log_fd;   /* -1 = inherit terminal; >=0 = redirect stdout+stderr here */
 } NamespaceConfig;
 
 typedef struct {

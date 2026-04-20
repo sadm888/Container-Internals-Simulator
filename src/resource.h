@@ -18,6 +18,8 @@ typedef struct {
 } ResourceConfig;
 
 int resource_apply_limits(const ResourceConfig *config);
+int resource_try_cgroup(const char *container_id, const ResourceConfig *config, pid_t pid);
+void resource_cleanup_cgroup(const char *container_id);
 const char *resource_profile(void);
 void resource_format_limits(const ResourceConfig *config, char *buffer, size_t buffer_size);
 void resource_format_error(int err, char *buffer, size_t buffer_size);

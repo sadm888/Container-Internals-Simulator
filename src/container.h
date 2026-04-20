@@ -3,7 +3,9 @@
 
 #include <stddef.h>
 #include <sys/types.h>
+#include <time.h>
 
+#include "image.h"
 #include "resource.h"
 
 #define CONTAINER_ID_LEN 64
@@ -11,10 +13,12 @@
 #define CONTAINER_HOSTNAME_LEN 64
 #define CONTAINER_ROOTFS_LEN 512
 #define CONTAINER_COMMAND_LEN 256
+#define CONTAINER_LOG_PATH_LEN 256
 
 typedef enum {
     STATE_CREATED,
     STATE_RUNNING,
+    STATE_PAUSED,
     STATE_STOPPED
 } ContainerState;
 
@@ -33,8 +37,13 @@ typedef struct Container {
     char              hostname[CONTAINER_HOSTNAME_LEN];
     char              rootfs[CONTAINER_ROOTFS_LEN];
     char              command_line[CONTAINER_COMMAND_LEN];
+    char              log_path[CONTAINER_LOG_PATH_LEN];
+    char              image_ref[IMAGE_REF_LEN]; /* "name:tag" or "" if not from image */
     ResourceConfig    resource_limits;
     ContainerState    state;
+    time_t            started_at;
+    time_t            stopped_at;
+    int               exit_code;
     char             *stack;
     struct Container *next;
 } Container;
@@ -59,6 +68,12 @@ int container_stats(const char *id);
 int container_stats_all(void);
 int container_stats_watch(const char *id, unsigned int interval_sec);
 int container_stats_all_watch(unsigned int interval_sec);
+int container_inspect(const char *id);
+int container_net(const char *id);
+int container_logs(const char *id);
+int container_exec(const char *id, const char *command_line);
+int container_pause(const char *id);
+int container_unpause(const char *id);
 
 /* Ctrl+C handling for watch loops / CLI. */
 void container_request_interrupt(void);

@@ -1,9 +1,15 @@
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #include "resource.h"
+
+#define CGROUP_ROOT "/sys/fs/cgroup"
 
 static int apply_single_limit_lower_only(int resource, rlim_t requested) {
     struct rlimit current;
@@ -82,42 +88,30 @@ const char *resource_profile(void) {
 }
 
 void resource_format_limits(const ResourceConfig *config, char *buffer, size_t buffer_size) {
+    char cpu_text[32];
+    char mem_text[32];
+    char proc_text[32];
+
     if (config == NULL || buffer == NULL || buffer_size == 0) {
         return;
     }
 
-    snprintf(buffer,
-             buffer_size,
-             "cpu=%s mem=%s nproc=%s",
-             (config->cpu_seconds == 0) ? "unlimited" : "",
-             (config->memory_mb == 0) ? "unlimited" : "",
-             (config->max_processes == 0) ? "unlimited" : "");
+    if (config->cpu_seconds == 0)
+        snprintf(cpu_text, sizeof(cpu_text), "unlimited");
+    else
+        snprintf(cpu_text, sizeof(cpu_text), "%us", config->cpu_seconds);
 
-    if (config->cpu_seconds != 0 || config->memory_mb != 0 || config->max_processes != 0) {
-        char cpu_text[32];
-        char mem_text[32];
-        char proc_text[32];
+    if (config->memory_mb == 0)
+        snprintf(mem_text, sizeof(mem_text), "unlimited");
+    else
+        snprintf(mem_text, sizeof(mem_text), "%uMB", config->memory_mb);
 
-        if (config->cpu_seconds == 0) {
-            snprintf(cpu_text, sizeof(cpu_text), "unlimited");
-        } else {
-            snprintf(cpu_text, sizeof(cpu_text), "%us", config->cpu_seconds);
-        }
+    if (config->max_processes == 0)
+        snprintf(proc_text, sizeof(proc_text), "unlimited");
+    else
+        snprintf(proc_text, sizeof(proc_text), "%u", config->max_processes);
 
-        if (config->memory_mb == 0) {
-            snprintf(mem_text, sizeof(mem_text), "unlimited");
-        } else {
-            snprintf(mem_text, sizeof(mem_text), "%uMB", config->memory_mb);
-        }
-
-        if (config->max_processes == 0) {
-            snprintf(proc_text, sizeof(proc_text), "unlimited");
-        } else {
-            snprintf(proc_text, sizeof(proc_text), "%u", config->max_processes);
-        }
-
-        snprintf(buffer, buffer_size, "cpu=%s mem=%s nproc=%s", cpu_text, mem_text, proc_text);
-    }
+    snprintf(buffer, buffer_size, "cpu=%s mem=%s nproc=%s", cpu_text, mem_text, proc_text);
 }
 
 void resource_format_error(int err, char *buffer, size_t buffer_size) {
@@ -136,4 +130,69 @@ void resource_format_error(int err, char *buffer, size_t buffer_size) {
             snprintf(buffer, buffer_size, "%s", strerror(err));
             break;
     }
+}
+
+static int write_cgroup_file(const char *cgroup_path, const char *filename, const char *value) {
+    char path[512];
+    FILE *f;
+
+    snprintf(path, sizeof(path), "%s/%s", cgroup_path, filename);
+    f = fopen(path, "w");
+    if (f == NULL) {
+        return -1;
+    }
+    fputs(value, f);
+    fclose(f);
+    return 0;
+}
+
+int resource_try_cgroup(const char *container_id, const ResourceConfig *config, pid_t pid) {
+    char cgroup_path[256];
+    char value[64];
+
+    if (container_id == NULL || config == NULL || pid <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    snprintf(cgroup_path, sizeof(cgroup_path), "%s/%s", CGROUP_ROOT, container_id);
+    if (mkdir(cgroup_path, 0755) != 0 && errno != EEXIST) {
+        return -1;
+    }
+
+    if (config->memory_mb != 0) {
+        snprintf(value, sizeof(value), "%llu\n",
+                 (unsigned long long)config->memory_mb * 1024ULL * 1024ULL);
+        if (write_cgroup_file(cgroup_path, "memory.max", value) != 0) {
+            rmdir(cgroup_path);
+            return -1;
+        }
+    }
+
+    if (config->max_processes != 0) {
+        snprintf(value, sizeof(value), "%u\n", config->max_processes);
+        write_cgroup_file(cgroup_path, "pids.max", value);
+    }
+
+    /* cpu_seconds is a total-time budget enforced by RLIMIT_CPU in the child.
+     * cgroups cpu.max controls rate, not total time — skip it here. */
+
+    snprintf(value, sizeof(value), "%d\n", (int)pid);
+    if (write_cgroup_file(cgroup_path, "cgroup.procs", value) != 0) {
+        rmdir(cgroup_path);
+        return -1;
+    }
+
+    return 0;
+}
+
+void resource_cleanup_cgroup(const char *container_id) {
+    char cgroup_path[256];
+
+    if (container_id == NULL) {
+        return;
+    }
+
+    snprintf(cgroup_path, sizeof(cgroup_path), "%s/%s", CGROUP_ROOT, container_id);
+    rmdir(cgroup_path);
 }

@@ -10,6 +10,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#define BOOTSTRAP_MARKER ".bootstrapped"
+
 #include "filesystem.h"
 
 #define OLD_ROOT_DIR ".old_root"
@@ -596,11 +598,25 @@ int filesystem_prepare_rootfs(const char *requested_rootfs,
         return -1;
     }
 
-    if (bootstrap_rootfs_tools(absolute_rootfs) != 0) {
-        return -1;
-    }
-    if (bootstrap_rootfs_workloads(absolute_rootfs) != 0) {
-        return -1;
+    {
+        char marker[PATH_MAX];
+        int marker_fd;
+
+        snprintf(marker, sizeof(marker), "%.*s/%s",
+                 (int)(sizeof(marker) - sizeof(BOOTSTRAP_MARKER) - 2),
+                 absolute_rootfs, BOOTSTRAP_MARKER);
+        if (access(marker, F_OK) != 0) {
+            if (bootstrap_rootfs_tools(absolute_rootfs) != 0) {
+                return -1;
+            }
+            if (bootstrap_rootfs_workloads(absolute_rootfs) != 0) {
+                return -1;
+            }
+            marker_fd = open(marker, O_CREAT | O_WRONLY, 0644);
+            if (marker_fd >= 0) {
+                close(marker_fd);
+            }
+        }
     }
 
     if (snprintf(resolved_rootfs, resolved_rootfs_size, "%s", absolute_rootfs) >=

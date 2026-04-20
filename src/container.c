@@ -1,15 +1,20 @@
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <termios.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "container.h"
 #include "filesystem.h"
+#include "image.h"
 #include "logger.h"
 #include "monitor.h"
 #include "network.h"
@@ -45,6 +50,8 @@ static const char *state_to_string(ContainerState state) {
             return "CREATED";
         case STATE_RUNNING:
             return "RUNNING";
+        case STATE_PAUSED:
+            return "PAUSED";
         case STATE_STOPPED:
             return "STOPPED";
         default:
@@ -55,6 +62,9 @@ static const char *state_to_string(ContainerState state) {
 static ContainerState string_to_state(const char *value) {
     if (strcmp(value, "RUNNING") == 0) {
         return STATE_RUNNING;
+    }
+    if (strcmp(value, "PAUSED") == 0) {
+        return STATE_PAUSED;
     }
     if (strcmp(value, "STOPPED") == 0) {
         return STATE_STOPPED;
@@ -138,7 +148,7 @@ static int save_metadata(void) {
     }
 
     for (Container *cursor = head; cursor != NULL; cursor = cursor->next) {
-        fprintf(file, "%s\t%s\t%d\t%s\t%s\t%s\t%s\t%u\t%u\t%u\n",
+        fprintf(file, "%s\t%s\t%d\t%s\t%s\t%s\t%s\t%u\t%u\t%u\t%ld\t%ld\t%d\t%s\t%s\n",
                 cursor->id,
                 cursor->name,
                 (int)cursor->pid,
@@ -148,7 +158,12 @@ static int save_metadata(void) {
                 cursor->command_line,
                 cursor->resource_limits.cpu_seconds,
                 cursor->resource_limits.memory_mb,
-                cursor->resource_limits.max_processes);
+                cursor->resource_limits.max_processes,
+                (long)cursor->started_at,
+                (long)cursor->stopped_at,
+                cursor->exit_code,
+                cursor->log_path,
+                cursor->image_ref);
     }
 
     if (fclose(file) != 0) {
@@ -208,7 +223,13 @@ static int sync_container_state(Container *container) {
     int status = 0;
     pid_t result = 0;
 
-    if (container->state != STATE_RUNNING || container->pid <= 0) {
+    if ((container->state != STATE_RUNNING && container->state != STATE_PAUSED) ||
+        container->pid <= 0) {
+        return 0;
+    }
+
+    /* Don't try to reap a paused process — it isn't done yet. */
+    if (container->state == STATE_PAUSED) {
         return 0;
     }
 
@@ -217,10 +238,13 @@ static int sync_container_state(Container *container) {
         char reason[64];
         pid_t old_pid = container->pid;
 
+        container->stopped_at = time(NULL);
+        container->exit_code  = WIFEXITED(status) ? WEXITSTATUS(status) : -WTERMSIG(status);
         container->state = STATE_STOPPED;
-        container->pid = -1;
+        container->pid   = -1;
         free_container_stack(container);
         container_scheduler_on_stopped(old_pid);
+        resource_cleanup_cgroup(container->id);
         format_wait_status(status, reason, sizeof(reason));
         log_event("%s exited and was reaped by manager (%s)", container->id, reason);
         return 1;
@@ -234,6 +258,7 @@ static int sync_container_state(Container *container) {
         container->state = STATE_STOPPED;
         container->pid = -1;
         free_container_stack(container);
+        resource_cleanup_cgroup(container->id);
         log_event("%s marked stopped after recovery check", container->id);
         state_changed = 1;
     }
@@ -335,9 +360,12 @@ static int wait_for_container_process(Container *container, int quiet) {
 
     format_wait_status(status, reason, sizeof(reason));
     log_event("%s finished (%s)", container->id, reason);
-    container->pid = -1;
+    container->stopped_at = time(NULL);
+    container->exit_code  = WIFEXITED(status) ? WEXITSTATUS(status) : -WTERMSIG(status);
+    container->pid   = -1;
     container->state = STATE_STOPPED;
     free_container_stack(container);
+    resource_cleanup_cgroup(container->id);
 
     if (save_metadata() != 0) {
         return -1;
@@ -351,11 +379,17 @@ static int wait_for_container_process(Container *container, int quiet) {
 }
 
 static int stop_container_process(Container *container, int quiet) {
-    if (container->state != STATE_RUNNING || container->pid <= 0) {
+    if ((container->state != STATE_RUNNING && container->state != STATE_PAUSED) ||
+        container->pid <= 0) {
         if (!quiet) {
             printf("[manager] %s is not running\n\n", container->id);
         }
         return -1;
+    }
+
+    /* Resume a paused container before killing so SIGKILL is delivered cleanly. */
+    if (container->state == STATE_PAUSED) {
+        kill(container->pid, SIGCONT);
     }
 
     if (kill(container->pid, SIGKILL) != 0 && errno != ESRCH) {
@@ -376,7 +410,10 @@ static int stop_container_process(Container *container, int quiet) {
 
     log_event("%s STOPPED (pid %d)", container->id, container->pid);
     container_scheduler_on_stopped(container->pid);
-    container->pid = -1;
+    resource_cleanup_cgroup(container->id);
+    container->stopped_at = time(NULL);
+    container->exit_code  = -2;
+    container->pid   = -1;
     container->state = STATE_STOPPED;
     free_container_stack(container);
     save_metadata();
@@ -440,19 +477,19 @@ int container_manager_init(void) {
     }
 
     while (fgets(line, sizeof(line), file) != NULL) {
-        char *fields[10];
+        char *fields[15];
         char *token = NULL;
         Container *container = NULL;
         int index = 0;
 
         trim_newline(line);
         token = strtok(line, "\t");
-        while (token != NULL && index < 10) {
+        while (token != NULL && index < 15) {
             fields[index++] = token;
             token = strtok(NULL, "\t");
         }
 
-        if (index != 6 && index != 7 && index != 10) {
+        if (index < 6) {
             continue;
         }
 
@@ -469,18 +506,33 @@ int container_manager_init(void) {
         copy_string(container->hostname, sizeof(container->hostname), fields[3]);
         copy_string(container->rootfs, sizeof(container->rootfs), fields[4]);
         container->state = string_to_state(fields[5]);
-        if (index >= 7) {
-            copy_string(container->command_line, sizeof(container->command_line), fields[6]);
-        } else {
-            copy_string(container->command_line, sizeof(container->command_line), DEFAULT_CONTAINER_COMMAND);
-        }
+
+        copy_string(container->command_line, sizeof(container->command_line),
+                    (index >= 7) ? fields[6] : DEFAULT_CONTAINER_COMMAND);
+
         if (index >= 10) {
-            container->resource_limits.cpu_seconds = (unsigned int)strtoul(fields[7], NULL, 10);
-            container->resource_limits.memory_mb = (unsigned int)strtoul(fields[8], NULL, 10);
+            container->resource_limits.cpu_seconds  = (unsigned int)strtoul(fields[7], NULL, 10);
+            container->resource_limits.memory_mb    = (unsigned int)strtoul(fields[8], NULL, 10);
             container->resource_limits.max_processes = (unsigned int)strtoul(fields[9], NULL, 10);
         } else {
             memset(&container->resource_limits, 0, sizeof(container->resource_limits));
         }
+
+        if (index >= 14) {
+            container->started_at  = (time_t)atol(fields[10]);
+            container->stopped_at  = (time_t)atol(fields[11]);
+            container->exit_code   = atoi(fields[12]);
+            copy_string(container->log_path, sizeof(container->log_path), fields[13]);
+        } else {
+            container->started_at = 0;
+            container->stopped_at = 0;
+            container->exit_code  = -1;
+            container->log_path[0] = '\0';
+        }
+
+        copy_string(container->image_ref, sizeof(container->image_ref),
+                    (index >= 15) ? fields[14] : "");
+
         (void)normalize_resource_limits(&container->resource_limits);
         container->stack = NULL;
 
@@ -531,8 +583,17 @@ int container_create(const ContainerSpec *spec, char *out_id, size_t out_id_size
         copy_string(container->hostname, sizeof(container->hostname), container->name);
     }
 
+    container->image_ref[0] = '\0';
     if (spec != NULL && spec->rootfs != NULL && spec->rootfs[0] != '\0') {
-        copy_string(requested_rootfs, sizeof(requested_rootfs), spec->rootfs);
+        /* Try to resolve as an image name first; fall back to treating as a path. */
+        char resolved_image[IMAGE_PATH_LEN];
+        if (image_resolve(spec->rootfs, resolved_image, sizeof(resolved_image)) == 0) {
+            copy_string(requested_rootfs, sizeof(requested_rootfs), resolved_image);
+            /* Store the image ref ("name:tag") for later display in inspect. */
+            snprintf(container->image_ref, sizeof(container->image_ref), "%s", spec->rootfs);
+        } else {
+            copy_string(requested_rootfs, sizeof(requested_rootfs), spec->rootfs);
+        }
     } else {
         snprintf(requested_rootfs, sizeof(requested_rootfs), "./rootfs/%s", container->id);
     }
@@ -557,7 +618,11 @@ int container_create(const ContainerSpec *spec, char *out_id, size_t out_id_size
         return -1;
     }
 
-    container->pid = -1;
+    container->pid        = -1;
+    container->started_at = 0;
+    container->stopped_at = 0;
+    container->exit_code  = -1;
+    container->log_path[0] = '\0';
     container->state = STATE_CREATED;
     append_container(container);
 
@@ -660,6 +725,16 @@ static int start_container_by_id(const char *id, int schedule_target) {
     namespace_config.rootfs = container->rootfs;
     namespace_config.command_line = container->command_line;
     namespace_config.resource_limits = container->resource_limits;
+    namespace_config.log_fd = -1;
+
+    if (container->log_path[0] != '\0') {
+        namespace_config.log_fd = open(container->log_path,
+                                       O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (namespace_config.log_fd < 0) {
+            log_event("%s warning: could not open log file %s",
+                      container->id, container->log_path);
+        }
+    }
 
     if (namespace_start_container(&namespace_config,
                                   container->stack,
@@ -675,8 +750,19 @@ static int start_container_by_id(const char *id, int schedule_target) {
         return -1;
     }
 
-    container->pid = start_result.host_pid;
-    container->state = STATE_RUNNING;
+    container->pid        = start_result.host_pid;
+    container->state      = STATE_RUNNING;
+    container->started_at = time(NULL);
+    container->exit_code  = -1;
+
+    if (resource_try_cgroup(container->id, &container->resource_limits, container->pid) == 0) {
+        log_event("%s cgroup applied (mem=%uMB nproc=%u)",
+                  container->id,
+                  container->resource_limits.memory_mb,
+                  container->resource_limits.max_processes);
+    } else {
+        log_event("%s cgroup unavailable, rlimits active", container->id);
+    }
 
     if (save_metadata() != 0) {
         stop_container_process(container, 1);
@@ -729,9 +815,18 @@ int container_run(const ContainerSpec *spec, char *out_id, size_t out_id_size) {
 
 int container_run_background(const ContainerSpec *spec, char *out_id, size_t out_id_size) {
     char container_id[CONTAINER_ID_LEN];
+    Container *container = NULL;
 
     if (container_create(spec, container_id, sizeof(container_id)) != 0) {
         return -1;
+    }
+
+    container = find_container(container_id);
+    if (container != NULL) {
+        mkdir("logs", 0755);
+        snprintf(container->log_path, sizeof(container->log_path),
+                 "logs/%s.log", container_id);
+        save_metadata();
     }
 
     if (start_container_by_id(container_id, 1) != 0) {
@@ -800,27 +895,35 @@ int container_delete(const char *id) {
     return 0;
 }
 
+static void format_uptime(time_t seconds, char *buf, size_t size) {
+    if (seconds <= 0) {
+        snprintf(buf, size, "-");
+    } else if (seconds < 60) {
+        snprintf(buf, size, "%lds", (long)seconds);
+    } else if (seconds < 3600) {
+        snprintf(buf, size, "%ldm%lds", (long)seconds / 60, (long)seconds % 60);
+    } else {
+        snprintf(buf, size, "%ldh%ldm", (long)seconds / 3600, ((long)seconds % 3600) / 60);
+    }
+}
+
 int container_list(void) {
     int count = 0;
+    time_t now = time(NULL);
 
     poll_states();
 
     printf("\n");
-    printf("Isolation profile: %s\n", namespace_profile());
-    printf("Filesystem profile: %s\n", filesystem_profile());
-    printf("%-16s %-16s %-8s %-16s %-28s %-10s %-24s %-24s\n",
-           "ID",
-           "NAME",
-           "PID",
-           "HOSTNAME",
-           "ROOTFS",
-           "STATE",
-           "COMMAND",
-           "LIMITS");
-    printf("-------------------------------------------------------------------------------------------------------------------------------------------------\n");
+    printf("Isolation : %s\n", namespace_profile());
+    printf("Filesystem: %s\n", filesystem_profile());
+    printf("%-16s %-16s %-8s %-10s %-12s %-24s %-24s\n",
+           "ID", "NAME", "PID", "STATE", "UPTIME", "COMMAND", "LIMITS");
+    printf("-----------------------------------------------------------------------------------------------\n");
 
     for (Container *cursor = head; cursor != NULL; cursor = cursor->next) {
         char pid_text[16];
+        char uptime_text[24];
+        char limits_text[128];
 
         if (cursor->pid > 0) {
             snprintf(pid_text, sizeof(pid_text), "%d", (int)cursor->pid);
@@ -828,16 +931,22 @@ int container_list(void) {
             copy_string(pid_text, sizeof(pid_text), "-");
         }
 
-        char limits_text[128];
+        if (cursor->state == STATE_RUNNING && cursor->started_at > 0) {
+            format_uptime(now - cursor->started_at, uptime_text, sizeof(uptime_text));
+        } else if (cursor->state == STATE_STOPPED &&
+                   cursor->started_at > 0 && cursor->stopped_at > 0) {
+            format_uptime(cursor->stopped_at - cursor->started_at, uptime_text, sizeof(uptime_text));
+        } else {
+            copy_string(uptime_text, sizeof(uptime_text), "-");
+        }
 
         resource_format_limits(&cursor->resource_limits, limits_text, sizeof(limits_text));
-        printf("%-16s %-16s %-8s %-16s %-28s %-10s %-24s %-24s\n",
+        printf("%-16s %-16s %-8s %-10s %-12s %-24s %-24s\n",
                cursor->id,
                cursor->name,
                pid_text,
-               cursor->hostname,
-               cursor->rootfs,
                state_to_string(cursor->state),
+               uptime_text,
                cursor->command_line,
                limits_text);
         count++;
@@ -854,17 +963,18 @@ int container_list(void) {
 static void print_stats_header(void) {
     printf("\n");
     printf("Monitor profile: %s\n", monitor_profile());
-    printf("%-16s %-8s %-6s %-10s %-8s %-10s %-10s %-6s %-24s\n",
+    printf("%-16s %-8s %-6s %-10s %-8s %-10s %-8s %-10s %-6s %-24s\n",
            "ID",
            "PID",
            "STATE",
            "CPU(s)",
            "CPU(%)",
            "RSS(MB)",
+           "MEM%",
            "VSZ(MB)",
            "THR",
            "COMMAND");
-    printf("---------------------------------------------------------------------------------------------------------------\n");
+    printf("-----------------------------------------------------------------------------------------------------------------------\n");
 }
 
 static void print_stats_row(const Container *container, const MonitorStats *stats, int has_cpu_pct, double cpu_pct) {
@@ -872,6 +982,7 @@ static void print_stats_row(const Container *container, const MonitorStats *stat
     double vsize_mb = 0.0;
     char state_text[8];
     char cpu_pct_text[16];
+    char mem_pct_text[16];
 
     if (container == NULL || stats == NULL) {
         return;
@@ -887,13 +998,21 @@ static void print_stats_row(const Container *container, const MonitorStats *stat
         snprintf(cpu_pct_text, sizeof(cpu_pct_text), "%.1f", cpu_pct);
     }
 
-    printf("%-16s %-8d %-6s %-10.2f %-8s %-10.1f %-10.1f %-6ld %-24s\n",
+    if (container->resource_limits.memory_mb > 0 && stats->rss_bytes > 0) {
+        double limit_bytes = (double)container->resource_limits.memory_mb * 1024.0 * 1024.0;
+        snprintf(mem_pct_text, sizeof(mem_pct_text), "%.1f%%", (stats->rss_bytes / limit_bytes) * 100.0);
+    } else {
+        snprintf(mem_pct_text, sizeof(mem_pct_text), "-");
+    }
+
+    printf("%-16s %-8d %-6s %-10.2f %-8s %-10.1f %-8s %-10.1f %-6ld %-24s\n",
            container->id,
            (int)stats->pid,
            state_text,
            stats->cpu_seconds,
            cpu_pct_text,
            rss_mb,
+           mem_pct_text,
            vsize_mb,
            stats->threads,
            container->command_line);
@@ -915,7 +1034,8 @@ int container_stats(const char *id) {
         return -1;
     }
 
-    if (container->state != STATE_RUNNING || container->pid <= 0) {
+    if ((container->state != STATE_RUNNING && container->state != STATE_PAUSED) ||
+        container->pid <= 0) {
         printf("[manager] %s is not running\n\n", container->id);
         return -1;
     }
@@ -940,7 +1060,8 @@ int container_stats_all(void) {
     for (Container *cursor = head; cursor != NULL; cursor = cursor->next) {
         MonitorStats stats;
 
-        if (cursor->state != STATE_RUNNING || cursor->pid <= 0) {
+        if ((cursor->state != STATE_RUNNING && cursor->state != STATE_PAUSED) ||
+            cursor->pid <= 0) {
             continue;
         }
 
@@ -1151,13 +1272,452 @@ int container_stats_all_watch(unsigned int interval_sec) {
     }
 }
 
+static void print_proc_tree(pid_t root_pid) {
+    pid_t children[128];
+    int child_count = 0;
+    DIR *proc_dir;
+    struct dirent *entry;
+
+    proc_dir = opendir("/proc");
+    if (proc_dir == NULL) {
+        return;
+    }
+
+    while ((entry = readdir(proc_dir)) != NULL && child_count < 128) {
+        pid_t pid;
+        char status_path[64];
+        FILE *f;
+        char line[128];
+
+        pid = (pid_t)atoi(entry->d_name);
+        if (pid <= 0) {
+            continue;
+        }
+
+        snprintf(status_path, sizeof(status_path), "/proc/%d/status", (int)pid);
+        f = fopen(status_path, "r");
+        if (f == NULL) {
+            continue;
+        }
+
+        while (fgets(line, sizeof(line), f) != NULL) {
+            if (strncmp(line, "PPid:", 5) == 0) {
+                if ((pid_t)atoi(line + 5) == root_pid) {
+                    children[child_count++] = pid;
+                }
+                break;
+            }
+        }
+        fclose(f);
+    }
+    closedir(proc_dir);
+
+    {
+        char comm[64] = "?";
+        char comm_path[64];
+        FILE *f;
+
+        snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", (int)root_pid);
+        f = fopen(comm_path, "r");
+        if (f != NULL) {
+            if (fgets(comm, sizeof(comm), f) != NULL) {
+                comm[strcspn(comm, "\n")] = '\0';
+            }
+            fclose(f);
+        }
+
+        printf("  \"ProcessTree\" : [\n");
+        printf("    \"%d (%s)\"", (int)root_pid, comm);
+
+        for (int i = 0; i < child_count; i++) {
+            char child_comm[64] = "?";
+            snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", (int)children[i]);
+            f = fopen(comm_path, "r");
+            if (f != NULL) {
+                if (fgets(child_comm, sizeof(child_comm), f) != NULL) {
+                    child_comm[strcspn(child_comm, "\n")] = '\0';
+                }
+                fclose(f);
+            }
+            const char *branch = (i == child_count - 1) ? "└── " : "├── ";
+            printf(",\n    \"%s%d (%s)\"", branch, (int)children[i], child_comm);
+        }
+        printf("\n  ]");
+    }
+}
+
+static long read_oom_kill_count(const char *container_id) {
+    char path[256];
+    FILE *f;
+    char line[128];
+
+    snprintf(path, sizeof(path), "/sys/fs/cgroup/%s/memory.events", container_id);
+    f = fopen(path, "r");
+    if (f == NULL) {
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (strncmp(line, "oom_kill ", 9) == 0) {
+            long count = atol(line + 9);
+            fclose(f);
+            return count;
+        }
+    }
+    fclose(f);
+    return 0;
+}
+
+int container_inspect(const char *id) {
+    Container *container = NULL;
+
+    if (id == NULL || id[0] == '\0') {
+        printf("[error] usage: inspect <id>\n\n");
+        return -1;
+    }
+
+    poll_states();
+    container = find_container(id);
+    if (container == NULL) {
+        printf("[error] container %s not found\n\n", id);
+        return -1;
+    }
+
+    {
+        char started_buf[32] = "-";
+        char stopped_buf[32] = "-";
+        char uptime_buf[24]  = "-";
+        char exit_buf[16];
+        time_t now = time(NULL);
+
+        if (container->started_at > 0) {
+            strftime(started_buf, sizeof(started_buf), "%Y-%m-%dT%H:%M:%S",
+                     localtime(&container->started_at));
+        }
+        if (container->stopped_at > 0) {
+            strftime(stopped_buf, sizeof(stopped_buf), "%Y-%m-%dT%H:%M:%S",
+                     localtime(&container->stopped_at));
+        }
+        if (container->state == STATE_RUNNING && container->started_at > 0) {
+            format_uptime(now - container->started_at, uptime_buf, sizeof(uptime_buf));
+        } else if (container->started_at > 0 && container->stopped_at > 0) {
+            format_uptime(container->stopped_at - container->started_at,
+                          uptime_buf, sizeof(uptime_buf));
+        }
+        if (container->exit_code == -1) {
+            snprintf(exit_buf, sizeof(exit_buf), "running");
+        } else if (container->exit_code == -2) {
+            snprintf(exit_buf, sizeof(exit_buf), "killed");
+        } else {
+            snprintf(exit_buf, sizeof(exit_buf), "%d", container->exit_code);
+        }
+
+        printf("{\n");
+        printf("  \"Id\"         : \"%s\",\n", container->id);
+        printf("  \"Name\"       : \"%s\",\n", container->name);
+        printf("  \"Image\"      : \"%s\",\n",
+               container->image_ref[0] ? container->image_ref : "(none)");
+        printf("  \"Pid\"        : %d,\n", (int)container->pid);
+        printf("  \"State\"      : \"%s\",\n", state_to_string(container->state));
+        printf("  \"ExitCode\"   : \"%s\",\n", exit_buf);
+        printf("  \"StartedAt\"  : \"%s\",\n", started_buf);
+        printf("  \"StoppedAt\"  : \"%s\",\n", stopped_buf);
+        printf("  \"Uptime\"     : \"%s\",\n", uptime_buf);
+        printf("  \"Hostname\"   : \"%s\",\n", container->hostname);
+        printf("  \"Rootfs\"     : \"%s\",\n", container->rootfs);
+        printf("  \"Command\"    : \"%s\",\n", container->command_line);
+        printf("  \"LogPath\"    : \"%s\",\n",
+               container->log_path[0] ? container->log_path : "(none)");
+        printf("  \"Limits\"     : {\n");
+        printf("    \"CpuSeconds\"   : %u,\n", container->resource_limits.cpu_seconds);
+        printf("    \"MemoryMB\"     : %u,\n", container->resource_limits.memory_mb);
+        printf("    \"MaxProcesses\" : %u\n",  container->resource_limits.max_processes);
+        printf("  },\n");
+        printf("  \"Isolation\"  : \"%s\",\n", namespace_profile());
+        printf("  \"Filesystem\" : \"%s\",\n", filesystem_profile());
+        printf("  \"Network\"    : \"%s\",\n", network_profile());
+        printf("  \"Resources\"  : \"%s\"", resource_profile());
+
+        if ((container->state == STATE_RUNNING || container->state == STATE_PAUSED) &&
+            container->pid > 0) {
+            long oom_kills = read_oom_kill_count(container->id);
+            printf(",\n  \"OomKills\"   : %ld", (oom_kills >= 0) ? oom_kills : 0);
+            printf(",\n");
+            print_proc_tree(container->pid);
+        } else {
+            printf("\n");
+        }
+        printf("}\n\n");
+    }
+
+    log_event("%s INSPECTED", container->id);
+    return 0;
+}
+
+int container_exec(const char *id, const char *command_line) {
+    Container *container = NULL;
+    char cmd_buf[256];
+    char *argv[32];
+    char *token;
+    int argc = 0;
+    /* uts, net, mnt — entered in this order; mnt is best-effort */
+    const char *ns_names[] = {"uts", "net", "mnt"};
+    int ns_types[]          = {CLONE_NEWUTS, CLONE_NEWNET, CLONE_NEWNS};
+    int ns_fds[3]           = {-1, -1, -1};
+    char ns_path[128];
+    int entered_mnt = 0;
+    pid_t child;
+    int status;
+    int i;
+
+    if (id == NULL || command_line == NULL || command_line[0] == '\0') {
+        printf("[error] usage: exec <id> <command> [args...]\n\n");
+        return -1;
+    }
+
+    poll_states();
+    container = find_container(id);
+    if (container == NULL) {
+        printf("[error] container %s not found\n\n", id);
+        return -1;
+    }
+    if (container->state != STATE_RUNNING || container->pid <= 0) {
+        printf("[error] %s is not running (state: %s)\n\n",
+               id, state_to_string(container->state));
+        return -1;
+    }
+
+    if (snprintf(cmd_buf, sizeof(cmd_buf), "%s", command_line) >= (int)sizeof(cmd_buf)) {
+        printf("[error] command too long\n\n");
+        return -1;
+    }
+
+    token = strtok(cmd_buf, " ");
+    while (token != NULL && argc < (int)(sizeof(argv) / sizeof(argv[0])) - 1) {
+        argv[argc++] = token;
+        token = strtok(NULL, " ");
+    }
+    if (argc == 0) {
+        printf("[error] empty command\n\n");
+        return -1;
+    }
+    argv[argc] = NULL;
+
+    for (i = 0; i < 3; i++) {
+        snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/%s",
+                 (int)container->pid, ns_names[i]);
+        ns_fds[i] = open(ns_path, O_RDONLY);
+    }
+
+    child = fork();
+    if (child < 0) {
+        printf("[error] fork failed: %s\n\n", strerror(errno));
+        for (i = 0; i < 3; i++) if (ns_fds[i] >= 0) close(ns_fds[i]);
+        return -1;
+    }
+
+    if (child == 0) {
+        /* Enter UTS and NET namespaces — required for hostname/network isolation. */
+        for (i = 0; i < 2; i++) {
+            if (ns_fds[i] >= 0) {
+                if (setns(ns_fds[i], ns_types[i]) != 0) {
+                    fprintf(stderr, "[exec] warning: could not enter %s namespace: %s\n",
+                            ns_names[i], strerror(errno));
+                }
+                close(ns_fds[i]);
+            }
+        }
+
+        /* Enter mount namespace — gives the container's full filesystem view.
+         * Best-effort: on WSL or with restricted permissions this may fail, in
+         * which case fall back to the /proc/<pid>/root bind trick below. */
+        if (ns_fds[2] >= 0) {
+            if (setns(ns_fds[2], CLONE_NEWNS) == 0) {
+                entered_mnt = 1;
+            }
+            close(ns_fds[2]);
+        }
+
+        if (entered_mnt) {
+            /* We're in the container's mount namespace; / is already its rootfs. */
+            chdir("/");
+        } else {
+            /* Fallback: bind the container rootfs via /proc/<pid>/root. */
+            char root_path[128];
+            snprintf(root_path, sizeof(root_path), "/proc/%d/root", (int)container->pid);
+            if (chdir(root_path) == 0) {
+                chroot(".");
+                chdir("/");
+            }
+        }
+
+        execvp(argv[0], argv);
+        fprintf(stderr, "[exec] %s: %s\n", argv[0], strerror(errno));
+        _exit(127);
+    }
+
+    for (i = 0; i < 3; i++) if (ns_fds[i] >= 0) close(ns_fds[i]);
+
+    waitpid(child, &status, 0);
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
+        printf("[exec] command not found in container: %s\n\n", argv[0]);
+        return -1;
+    }
+
+    log_event("%s EXEC \"%s\" (exit=%d)", container->id, command_line,
+              WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    return 0;
+}
+
+int container_pause(const char *id) {
+    Container *container = NULL;
+
+    if (id == NULL || id[0] == '\0') {
+        printf("[error] usage: pause <id>\n\n");
+        return -1;
+    }
+
+    poll_states();
+    container = find_container(id);
+    if (container == NULL) {
+        printf("[error] container %s not found\n\n", id);
+        return -1;
+    }
+
+    if (container->state != STATE_RUNNING || container->pid <= 0) {
+        printf("[error] %s is not running\n\n", container->id);
+        return -1;
+    }
+
+    if (kill(container->pid, SIGSTOP) != 0) {
+        printf("[error] failed to pause %s: %s\n\n", container->id, strerror(errno));
+        return -1;
+    }
+
+    container->state = STATE_PAUSED;
+    save_metadata();
+    printf("[manager] %s paused\n\n", container->id);
+    log_event("%s PAUSED (pid %d)", container->id, (int)container->pid);
+    return 0;
+}
+
+int container_unpause(const char *id) {
+    Container *container = NULL;
+
+    if (id == NULL || id[0] == '\0') {
+        printf("[error] usage: unpause <id>\n\n");
+        return -1;
+    }
+
+    poll_states();
+    container = find_container(id);
+    if (container == NULL) {
+        printf("[error] container %s not found\n\n", id);
+        return -1;
+    }
+
+    if (container->state != STATE_PAUSED || container->pid <= 0) {
+        printf("[error] %s is not paused\n\n", container->id);
+        return -1;
+    }
+
+    if (kill(container->pid, SIGCONT) != 0) {
+        printf("[error] failed to unpause %s: %s\n\n", container->id, strerror(errno));
+        return -1;
+    }
+
+    container->state = STATE_RUNNING;
+    save_metadata();
+    printf("[manager] %s unpaused\n\n", container->id);
+    log_event("%s UNPAUSED (pid %d)", container->id, (int)container->pid);
+    return 0;
+}
+
+int container_logs(const char *id) {
+    Container *container = NULL;
+    FILE *f = NULL;
+    char line[1024];
+
+    if (id == NULL || id[0] == '\0') {
+        printf("[error] usage: logs <id>\n\n");
+        return -1;
+    }
+
+    poll_states();
+    container = find_container(id);
+    if (container == NULL) {
+        printf("[error] container %s not found\n\n", id);
+        return -1;
+    }
+
+    if (container->log_path[0] == '\0') {
+        printf("[manager] %s has no log file (use runbg to capture output)\n\n", id);
+        return 0;
+    }
+
+    f = fopen(container->log_path, "r");
+    if (f == NULL) {
+        printf("[manager] log file not yet created for %s\n\n", id);
+        return 0;
+    }
+
+    printf("\n--- logs: %s ---\n", container->log_path);
+    while (fgets(line, sizeof(line), f) != NULL) {
+        printf("%s", line);
+    }
+    printf("--- end ---\n\n");
+    fclose(f);
+    return 0;
+}
+
+int container_net(const char *id) {
+    Container *container = NULL;
+    char netns_path[128];
+    char netns_link[256];
+    ssize_t n;
+
+    if (id == NULL || id[0] == '\0') {
+        printf("[error] usage: net <id>\n\n");
+        return -1;
+    }
+
+    poll_states();
+    container = find_container(id);
+    if (container == NULL) {
+        printf("[error] container %s not found\n\n", id);
+        return -1;
+    }
+
+    if (container->state != STATE_RUNNING || container->pid <= 0) {
+        printf("[manager] %s is not running\n\n", container->id);
+        return -1;
+    }
+
+    snprintf(netns_path, sizeof(netns_path), "/proc/%d/ns/net", (int)container->pid);
+    n = readlink(netns_path, netns_link, sizeof(netns_link) - 1);
+    if (n < 0) {
+        printf("[error] failed to read netns for %s\n\n", container->id);
+        return -1;
+    }
+    netns_link[n] = '\0';
+
+    printf("\n");
+    printf("  container : %s\n", container->id);
+    printf("  pid       : %d\n", (int)container->pid);
+    printf("  netns     : %s\n", netns_link);
+    printf("  profile   : %s\n", network_profile());
+    printf("\n");
+
+    return 0;
+}
+
 void cleanup_all_containers(void) {
     Container *cursor = head;
 
     poll_states();
 
     while (cursor != NULL) {
-        if (cursor->state == STATE_RUNNING) {
+        if (cursor->state == STATE_RUNNING || cursor->state == STATE_PAUSED) {
             stop_container_process(cursor, 1);
         }
         cursor = cursor->next;

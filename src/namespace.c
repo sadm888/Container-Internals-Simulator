@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/prctl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -29,6 +30,7 @@ typedef struct {
     int         status_fd;
     int         continue_fd;
     int         exec_fd;
+    int         log_fd;
 } NamespaceChildArgs;
 
 static int build_exec_argv(const char *command_line, char *buffer, size_t buffer_size, char **argv, int max_args) {
@@ -159,6 +161,8 @@ static int namespace_child(void *arg) {
         return 1;
     }
 
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+
     if (child_args->hostname != NULL && child_args->hostname[0] != '\0') {
         if (sethostname(child_args->hostname, strlen(child_args->hostname)) != 0) {
             status.error_number = errno;
@@ -225,6 +229,12 @@ static int namespace_child(void *arg) {
     status.namespace_pid = getpid();
     (void)write(child_args->status_fd, &status, sizeof(status));
     close(child_args->status_fd);
+
+    if (child_args->log_fd >= 0) {
+        dup2(child_args->log_fd, STDOUT_FILENO);
+        dup2(child_args->log_fd, STDERR_FILENO);
+        close(child_args->log_fd);
+    }
 
     execvp(argv[0], argv);
     exec_errno = errno;
@@ -349,6 +359,7 @@ int namespace_start_container(const NamespaceConfig *config,
     child_args.status_fd = status_pipe[1];
     child_args.continue_fd = continue_pipe[0];
     child_args.exec_fd = exec_pipe[1];
+    child_args.log_fd = config->log_fd;
 
     pid = clone(namespace_child, stack + stack_size, clone_flags, &child_args);
     if (pid < 0) {
@@ -360,6 +371,7 @@ int namespace_start_container(const NamespaceConfig *config,
         close(exec_pipe[1]);
         close(continue_pipe[0]);
         close(continue_pipe[1]);
+        if (config->log_fd >= 0) close(config->log_fd);
         errno = saved_errno;
         return -1;
     }
@@ -367,6 +379,9 @@ int namespace_start_container(const NamespaceConfig *config,
     close(exec_pipe[1]);
     close(status_pipe[1]);
     close(continue_pipe[0]);
+    if (config->log_fd >= 0) {
+        close(config->log_fd);
+    }
     memset(&status, 0, sizeof(status));
     status.namespace_pid = -1;
 
@@ -396,12 +411,12 @@ int namespace_start_container(const NamespaceConfig *config,
     close(continue_pipe[1]);
 
     if (read_status(status_pipe[0], &status) != 0 || status.ready == 0) {
-        int child_errno = status.error_number;
+        int setup_errno = status.error_number;
 
         close(status_pipe[0]);
         close(exec_pipe[0]);
         waitpid(pid, NULL, 0);
-        errno = (child_errno != 0) ? child_errno : EPROTO;
+        errno = (setup_errno != 0) ? setup_errno : EPROTO;
         return -1;
     }
 
