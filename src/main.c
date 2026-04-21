@@ -3,12 +3,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "bridge.h"
 #include "container.h"
+#include "eventbus.h"
 #include "image.h"
 #include "logger.h"
+#include "metrics.h"
 #include "scheduler.h"
 
 static void on_sigint(int sig) {
@@ -19,8 +22,8 @@ static void on_sigint(int sig) {
 static void print_banner(void) {
     printf("╔══════════════════════════════════════════════════════╗\n");
     printf("║         Container Internals Simulator                ║\n");
-    printf("║   Modules 1-10: Runtime+Net+Monitoring+Security      ║\n");
-    printf("║  NS|FS|Limits|Sched|Bridge|Veth|Caps|Seccomp|Exec  ║\n");
+    printf("║  Modules 1-11: Runtime+Net+Monitor+Security+Events  ║\n");
+    printf("║  NS|FS|Limits|Sched|Bridge|Caps|Seccomp|EventBus   ║\n");
     printf("╚══════════════════════════════════════════════════════╝\n\n");
 }
 
@@ -71,6 +74,8 @@ static void print_help(void) {
     printf("  pause <id>\n");
     printf("  unpause <id>\n");
     printf("  security <id>          (show security profile: caps, seccomp, readonly)\n");
+    printf("  events [-f] [-n N] [--type TYPE]  (show/stream events; filter by type)\n");
+    printf("  metrics [--prometheus] (counters + latency; --prometheus: exposition fmt)\n");
     printf("  help\n");
     printf("  exit\n\n");
 }
@@ -166,6 +171,9 @@ int main(void) {
 
     (void)signal(SIGINT, on_sigint);
 
+    eventbus_init();
+    metrics_init();
+
     if (container_manager_init() != 0) {
         return 1;
     }
@@ -176,12 +184,16 @@ int main(void) {
     }
     log_event("=== simulator started ===");
 
+    int interactive = isatty(STDIN_FILENO);
+
     while (1) {
         char *args[32] = {0};
         int argc = 0;
 
-        printf("container-sim> ");
-        fflush(stdout);
+        if (interactive) {
+            printf("container-sim> ");
+            fflush(stdout);
+        }
 
         if (fgets(line, sizeof(line), stdin) == NULL) {
             if (errno == EINTR || container_consume_interrupt()) {
@@ -312,10 +324,14 @@ int main(void) {
                 printf("[manager] scheduler enabled (%s, slice=%ums)\n\n",
                        scheduler_profile(),
                        scheduler_get_time_slice_ms());
+                eventbus_emit(EVENT_SCHED_ENABLED, NULL,
+                              scheduler_profile(),
+                              (long)scheduler_get_time_slice_ms());
             } else if (strcmp(args[1], "off") == 0) {
                 scheduler_set_enabled(0);
                 container_scheduler_refresh_targets();
                 printf("[manager] scheduler disabled\n\n");
+                eventbus_emit(EVENT_SCHED_DISABLED, NULL, NULL, 0);
             } else if (strcmp(args[1], "slice") == 0) {
                 unsigned int ms = 0;
                 if (argc != 3) {
@@ -448,15 +464,19 @@ int main(void) {
                 (argc == 2 && strcmp(args[1], "ls") == 0)) {
                 container_net_summary();
             } else if (strcmp(args[1], "init") == 0) {
-                if (bridge_init() == 0)
+                if (bridge_init() == 0) {
                     printf("[network] bridge %s up — subnet 172.17.0.0/16\n\n", BRIDGE_NAME);
-                else
+                    eventbus_emit(EVENT_NET_INIT, NULL, BRIDGE_NAME, 0);
+                } else {
                     printf("[error] bridge init failed (are you root?)\n\n");
+                }
             } else if (strcmp(args[1], "teardown") == 0) {
-                if (bridge_teardown() == 0)
+                if (bridge_teardown() == 0) {
                     printf("[network] bridge %s removed\n\n", BRIDGE_NAME);
-                else
+                    eventbus_emit(EVENT_NET_TEARDOWN, NULL, BRIDGE_NAME, 0);
+                } else {
                     printf("[error] bridge teardown failed\n\n");
+                }
             } else {
                 container_net(args[1]);
             }
@@ -538,6 +558,61 @@ int main(void) {
                 continue;
             }
             container_unpause(args[1]);
+        } else if (strcmp(args[0], "events") == 0) {
+            int follow = 0;
+            int n      = 20;
+            EventType type_filter = EVENT_TYPE_COUNT; /* all types */
+            int ev_idx = 1;
+            int ev_ok  = 1;
+
+            while (ev_idx < argc) {
+                if (strcmp(args[ev_idx], "-f") == 0 ||
+                    strcmp(args[ev_idx], "--follow") == 0) {
+                    follow = 1; ev_idx++;
+                } else if (strcmp(args[ev_idx], "-n") == 0 && ev_idx + 1 < argc) {
+                    n = (int)strtol(args[ev_idx + 1], NULL, 10);
+                    ev_idx += 2;
+                } else if (strcmp(args[ev_idx], "--type") == 0 && ev_idx + 1 < argc) {
+                    int t, found = 0;
+                    for (t = 0; t < (int)EVENT_TYPE_COUNT; t++) {
+                        if (strcmp(eventbus_type_name((EventType)t), args[ev_idx + 1]) == 0) {
+                            type_filter = (EventType)t;
+                            found = 1;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        printf("[error] unknown event type '%s'\n", args[ev_idx + 1]);
+                        printf("[hint]  valid types: CONTAINER_CREATED, CONTAINER_STARTED,"
+                               " CONTAINER_STOPPED, IMAGE_BUILT, OOM_KILL, ...\n\n");
+                        ev_ok = 0;
+                    }
+                    ev_idx += 2;
+                } else {
+                    break;
+                }
+            }
+
+            if (!ev_ok) {
+                /* error already printed */
+            } else if (follow) {
+                unsigned int cursor = eventbus_total();
+                printf("[hint] streaming events — press Ctrl+C to stop\n");
+                while (1) {
+                    if (container_consume_interrupt()) { printf("\n"); break; }
+                    cursor = eventbus_drain_from(cursor);
+                    fflush(stdout);
+                    { struct timespec ts = {0, 200000000}; nanosleep(&ts, NULL); }
+                }
+            } else {
+                eventbus_print_filtered(n, type_filter);
+            }
+        } else if (strcmp(args[0], "metrics") == 0) {
+            if (argc == 2 && strcmp(args[1], "--prometheus") == 0) {
+                metrics_print_prometheus();
+            } else {
+                metrics_print();
+            }
         } else if (strcmp(args[0], "security") == 0) {
             if (argc < 2) {
                 printf("[error] usage: security <id>\n\n");

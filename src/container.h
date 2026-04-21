@@ -54,6 +54,7 @@ typedef struct Container {
     time_t            started_at;
     time_t            stopped_at;
     int               exit_code;
+    long              oom_kill_count; /* runtime-only; not persisted */
     char             *stack;
     struct Container *next;
 } Container;

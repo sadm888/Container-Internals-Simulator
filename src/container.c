@@ -15,9 +15,11 @@
 
 #include "bridge.h"
 #include "container.h"
+#include "eventbus.h"
 #include "filesystem.h"
 #include "image.h"
 #include "logger.h"
+#include "metrics.h"
 #include "monitor.h"
 #include "network.h"
 #include "namespace.h"
@@ -284,6 +286,8 @@ static int sync_container_state(Container *container) {
         cleanup_container_network(container);
         format_wait_status(status, reason, sizeof(reason));
         log_event("%s exited and was reaped by manager (%s)", container->id, reason);
+        eventbus_emit(EVENT_CONTAINER_STOPPED, container->id, reason,
+                      (long)container->exit_code);
         return 1;
     }
 
@@ -298,16 +302,31 @@ static int sync_container_state(Container *container) {
         resource_cleanup_cgroup(container->id);
         cleanup_container_network(container);
         log_event("%s marked stopped after recovery check", container->id);
+        eventbus_emit(EVENT_CONTAINER_STOPPED, container->id, "recovery-check", -1);
         state_changed = 1;
     }
 
     return state_changed;
 }
 
+static long read_oom_kill_count(const char *container_id); /* forward decl */
+
 static void poll_states(void) {
     int changed = 0;
 
     for (Container *cursor = head; cursor != NULL; cursor = cursor->next) {
+        /* Detect new OOM kills before reaping — container may still be alive. */
+        if (cursor->state == STATE_RUNNING && cursor->pid > 0) {
+            long oom = read_oom_kill_count(cursor->id);
+            if (oom > 0 && oom > cursor->oom_kill_count) {
+                MonitorStats mst = {0};
+                long rss_mb = 0;
+                if (monitor_read(cursor->pid, &mst) == 0)
+                    rss_mb = (long)(mst.rss_bytes / (1024 * 1024));
+                eventbus_emit(EVENT_OOM_KILL, cursor->id, NULL, rss_mb);
+                cursor->oom_kill_count = oom;
+            }
+        }
         changed |= sync_container_state(cursor);
     }
 
@@ -402,6 +421,8 @@ static int wait_for_container_process(Container *container, int quiet) {
     container->exit_code  = WIFEXITED(status) ? WEXITSTATUS(status) : -WTERMSIG(status);
     container->pid   = -1;
     container->state = STATE_STOPPED;
+    eventbus_emit(EVENT_CONTAINER_STOPPED, container->id, reason,
+                  (long)container->exit_code);
     free_container_stack(container);
     resource_cleanup_cgroup(container->id);
     cleanup_container_network(container);
@@ -484,6 +505,7 @@ static int stop_container_process(Container *container, int quiet, int timeout_s
     container->exit_code  = -2;
     container->pid   = -1;
     container->state = STATE_STOPPED;
+    eventbus_emit(EVENT_CONTAINER_STOPPED, container->id, "killed", -2);
     free_container_stack(container);
     save_metadata();
 
@@ -762,6 +784,7 @@ int container_create(const ContainerSpec *spec, char *out_id, size_t out_id_size
               container->resource_limits.cpu_seconds,
               container->resource_limits.memory_mb,
               container->resource_limits.max_processes);
+    eventbus_emit(EVENT_CONTAINER_CREATED, container->id, container->rootfs, 0);
     return 0;
 }
 
@@ -840,6 +863,7 @@ static int start_container_by_id(const char *id, int schedule_target) {
     NamespaceConfig namespace_config;
     NamespaceStartResult start_result;
     int saved_errno = 0;
+    struct timespec t_start = {0}, t_end = {0};
 
     if (id == NULL || id[0] == '\0') {
         printf("[error] usage: start <id>\n\n");
@@ -888,6 +912,7 @@ static int start_container_by_id(const char *id, int schedule_target) {
     container->ip_address[0] = '\0';
     container->veth_host[0]  = '\0';
 
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
     if (namespace_start_container(&namespace_config,
                                   container->stack,
                                   STACK_SIZE,
@@ -962,6 +987,22 @@ static int start_container_by_id(const char *id, int schedule_target) {
               container->resource_limits.cpu_seconds,
               container->resource_limits.memory_mb,
               container->resource_limits.max_processes);
+
+    {
+        unsigned long elapsed_ms;
+        int i, cap_drop_count = 0;
+        clock_gettime(CLOCK_MONOTONIC, &t_end);
+        elapsed_ms = (unsigned long)(t_end.tv_sec - t_start.tv_sec) * 1000UL
+                   + (unsigned long)(t_end.tv_nsec - t_start.tv_nsec) / 1000000UL;
+        metrics_record_startup_ms(elapsed_ms);
+        eventbus_emit(EVENT_CONTAINER_STARTED, container->id,
+                      container->command_line, (long)elapsed_ms);
+        for (i = 0; i <= 37; i++)
+            if (!(container->security.cap_keep & (1ULL << i)))
+                cap_drop_count++;
+        eventbus_emit(EVENT_SECURITY_PROFILE_APPLIED, container->id, NULL,
+                      (long)cap_drop_count);
+    }
 
     if (schedule_target) {
         container_scheduler_on_started(container->pid);
@@ -1071,6 +1112,7 @@ int container_delete(const char *id) {
     }
 
     log_event("%s DELETED", container->id);
+    eventbus_emit(EVENT_CONTAINER_DELETED, container->id, NULL, 0);
     printf("[manager] deleted %s\n\n", container->id);
     free_container_stack(container);
     free(container);
@@ -1284,6 +1326,8 @@ int container_stats_all(void) {
             continue;
         }
 
+        metrics_update_mem_highwater(
+            (unsigned long)(stats.rss_bytes / (1024 * 1024)));
         print_stats_row(cursor, &stats, 0, 0.0);
         any = 1;
     }
@@ -1443,6 +1487,9 @@ int container_stats_all_watch(unsigned int interval_sec) {
             if (monitor_read(cursor->pid, &stats) != 0) {
                 continue;
             }
+
+            metrics_update_mem_highwater(
+                (unsigned long)(stats.rss_bytes / (1024 * 1024)));
 
             index = find_sample(prev, prev_count, stats.pid);
             if (index >= 0) {
@@ -1811,6 +1858,8 @@ int container_exec(const char *id, const char *command_line) {
 
     log_event("%s EXEC \"%s\" (exit=%d)", container->id, command_line,
               WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    eventbus_emit(EVENT_EXEC_LAUNCHED, container->id, command_line,
+                  (long)(WIFEXITED(status) ? WEXITSTATUS(status) : -1));
     return 0;
 }
 
@@ -1843,6 +1892,7 @@ int container_pause(const char *id) {
     save_metadata();
     printf("[manager] %s paused\n\n", container->id);
     log_event("%s PAUSED (pid %d)", container->id, (int)container->pid);
+    eventbus_emit(EVENT_CONTAINER_PAUSED, container->id, NULL, 0);
     return 0;
 }
 
@@ -1875,6 +1925,7 @@ int container_unpause(const char *id) {
     save_metadata();
     printf("[manager] %s unpaused\n\n", container->id);
     log_event("%s UNPAUSED (pid %d)", container->id, (int)container->pid);
+    eventbus_emit(EVENT_CONTAINER_UNPAUSED, container->id, NULL, 0);
     return 0;
 }
 

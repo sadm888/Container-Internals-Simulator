@@ -5,6 +5,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "eventbus.h"
 #include "image.h"
 
 #define IMAGE_REGISTRY     "images.meta"
@@ -112,12 +113,51 @@ static int find_record(ImageRecord *records, int count,
     return -1;
 }
 
-int image_build(const char *name, const char *tag, const char *rootfs_path) {
+/* ── internal registry write — no event emission ────────────────────── */
+
+static int image_register_internal(const char *name, const char *tag,
+                                   const char *abs_path) {
     ImageRecord records[256];
-    int count;
-    int idx;
+    int count, idx;
+
+    count = load_registry(records, 256);
+    idx   = find_record(records, count, name, tag);
+
+    if (idx >= 0) {
+        snprintf(records[idx].rootfs, sizeof(records[idx].rootfs), "%s", abs_path);
+        records[idx].created_at = (long)time(NULL);
+        if (save_registry(records, count) != 0) {
+            printf("[error] failed to save image registry\n\n");
+            return -1;
+        }
+        printf("[image] updated %s:%s -> %s\n\n", name, tag, abs_path);
+        return 0;
+    }
+
+    if (count >= 256) {
+        printf("[error] image registry full\n\n");
+        return -1;
+    }
+
+    snprintf(records[count].name,   sizeof(records[count].name),   "%s", name);
+    snprintf(records[count].tag,    sizeof(records[count].tag),     "%s", tag);
+    snprintf(records[count].rootfs, sizeof(records[count].rootfs),  "%s", abs_path);
+    records[count].created_at = (long)time(NULL);
+    count++;
+
+    if (save_registry(records, count) != 0) {
+        printf("[error] failed to save image registry\n\n");
+        return -1;
+    }
+
+    printf("[image] registered %s:%s -> %s\n\n", name, tag, abs_path);
+    return 0;
+}
+
+int image_build(const char *name, const char *tag, const char *rootfs_path) {
     char effective_tag[IMAGE_TAG_LEN];
     char abs_path[IMAGE_PATH_LEN];
+    char ref[IMAGE_REF_LEN];
 
     if (name == NULL || name[0] == '\0' ||
         rootfs_path == NULL || rootfs_path[0] == '\0') {
@@ -133,37 +173,11 @@ int image_build(const char *name, const char *tag, const char *rootfs_path) {
         return -1;
     }
 
-    count = load_registry(records, 256);
-    idx   = find_record(records, count, name, effective_tag);
-
-    if (idx >= 0) {
-        snprintf(records[idx].rootfs, sizeof(records[idx].rootfs), "%s", abs_path);
-        records[idx].created_at = (long)time(NULL);
-        if (save_registry(records, count) != 0) {
-            printf("[error] failed to save image registry\n\n");
-            return -1;
-        }
-        printf("[image] updated %s:%s -> %s\n\n", name, effective_tag, abs_path);
-        return 0;
-    }
-
-    if (count >= 256) {
-        printf("[error] image registry full\n\n");
+    if (image_register_internal(name, effective_tag, abs_path) != 0)
         return -1;
-    }
 
-    snprintf(records[count].name,   sizeof(records[count].name),   "%s", name);
-    snprintf(records[count].tag,    sizeof(records[count].tag),     "%s", effective_tag);
-    snprintf(records[count].rootfs, sizeof(records[count].rootfs),  "%s", abs_path);
-    records[count].created_at = (long)time(NULL);
-    count++;
-
-    if (save_registry(records, count) != 0) {
-        printf("[error] failed to save image registry\n\n");
-        return -1;
-    }
-
-    printf("[image] registered %s:%s -> %s\n\n", name, effective_tag, abs_path);
+    snprintf(ref, sizeof(ref), "%s:%s", name, effective_tag);
+    eventbus_emit(EVENT_IMAGE_BUILT, NULL, ref, 0);
     return 0;
 }
 
@@ -184,7 +198,15 @@ int image_tag(const char *src_ref, const char *dst_ref) {
     }
 
     parse_ref(dst_ref, dst_name, sizeof(dst_name), dst_tag, sizeof(dst_tag));
-    return image_build(dst_name, dst_tag, src_path);
+    if (image_register_internal(dst_name, dst_tag, src_path) != 0)
+        return -1;
+
+    {
+        char detail[EVENTBUS_DETAIL_LEN];
+        snprintf(detail, sizeof(detail), "%s -> %s", src_ref, dst_ref);
+        eventbus_emit(EVENT_IMAGE_TAGGED, NULL, detail, 0);
+    }
+    return 0;
 }
 
 int image_resolve(const char *ref, char *out_path, int out_size) {
@@ -328,5 +350,10 @@ int image_remove(const char *name, const char *tag) {
     }
 
     printf("[image] removed %s:%s\n\n", name, effective_tag);
+    {
+        char ref[IMAGE_REF_LEN];
+        snprintf(ref, sizeof(ref), "%s:%s", name, effective_tag);
+        eventbus_emit(EVENT_IMAGE_REMOVED, NULL, ref, 0);
+    }
     return 0;
 }
