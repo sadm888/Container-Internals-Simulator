@@ -31,6 +31,7 @@ run_suite tests/test_resources.sh
 run_suite tests/test_scheduler.sh
 run_suite tests/test_monitoring.sh
 run_suite tests/test_network.sh
+run_suite tests/test_security.sh
 
 echo ""
 echo "======================================"

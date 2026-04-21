@@ -6,6 +6,7 @@
 
 #include "network.h"
 #include "resource.h"
+#include "security.h"
 
 #define NAMESPACE_PROFILE "PID | UTS | MOUNT | NET"
 
@@ -29,6 +30,7 @@ typedef struct {
     const char      *rootfs;
     const char      *command_line;
     ResourceConfig   resource_limits;
+    SecurityConfig   security;
     int              log_fd;        /* -1 = inherit terminal */
     ns_net_setup_cb  net_setup;     /* NULL = loopback only  */
     void            *net_setup_data;

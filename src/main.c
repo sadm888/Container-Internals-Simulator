@@ -19,8 +19,8 @@ static void on_sigint(int sig) {
 static void print_banner(void) {
     printf("╔══════════════════════════════════════════════════════╗\n");
     printf("║         Container Internals Simulator                ║\n");
-    printf("║         Modules 1-9: Runtime + Net + Monitoring      ║\n");
-    printf("║  NS|FS|Limits|Sched|Bridge|Veth|Ports|Stats|Exec    ║\n");
+    printf("║   Modules 1-10: Runtime+Net+Monitoring+Security      ║\n");
+    printf("║  NS|FS|Limits|Sched|Bridge|Veth|Caps|Seccomp|Exec  ║\n");
     printf("╚══════════════════════════════════════════════════════╝\n\n");
 }
 
@@ -38,9 +38,12 @@ static int parse_command(char *line, char **args, int max_args) {
 
 static void print_help(void) {
     printf("Commands:\n");
-    printf("  run [--cpu SEC] [--mem MB] [--pids N] [--rm] <name> <hostname> <rootfs|image> <command> [args...]\n");
-    printf("  runbg [--cpu SEC] [--mem MB] [--pids N] <name> <hostname> <rootfs|image> <command> [args...]\n");
-    printf("  create [--cpu SEC] [--mem MB] [--pids N] [name] [hostname] [rootfs|image]\n");
+    printf("  run   [flags] <name> <hostname> <rootfs|image> <command> [args...]\n");
+    printf("  runbg [flags] <name> <hostname> <rootfs|image> <command> [args...]\n");
+    printf("  create [flags] [name] [hostname] [rootfs|image]\n");
+    printf("  Flags: --cpu SEC  --mem MB  --pids N  -p HOST:CTR  --rm\n");
+    printf("         --privileged   --read-only\n");
+    printf("         --cap-add <CAP_NAME>   --cap-drop <CAP_NAME>\n");
     printf("  image build <name>[:<tag>] <rootfs-path>\n");
     printf("  image tag <src>[:<tag>] <dst>[:<tag>]\n");
     printf("  image inspect <name>[:<tag>]\n");
@@ -67,13 +70,15 @@ static void print_help(void) {
     printf("  net <id>               (show per-container network detail)\n");
     printf("  pause <id>\n");
     printf("  unpause <id>\n");
+    printf("  security <id>          (show security profile: caps, seccomp, readonly)\n");
     printf("  help\n");
     printf("  exit\n\n");
 }
 
 static int parse_limit_flags(char **args, int argc, int *index,
                              ResourceConfig *limits, int *auto_remove,
-                             PortMapping *port_maps, int *port_map_count) {
+                             PortMapping *port_maps, int *port_map_count,
+                             SecurityConfig *security) {
     if (args == NULL || index == NULL || limits == NULL) {
         return -1;
     }
@@ -116,6 +121,35 @@ static int parse_limit_flags(char **args, int argc, int *index,
                                               &port_maps[*port_map_count],
                                               MAX_PORT_MAPS - *port_map_count);
                 *port_map_count += n;
+            }
+            *index += 2;
+            continue;
+        }
+        /* ── security flags ── */
+        if (strcmp(flag, "--privileged") == 0) {
+            if (security != NULL) *security = security_config_none();
+            *index += 1;
+            continue;
+        }
+        if (strcmp(flag, "--read-only") == 0) {
+            if (security != NULL) security->readonly_rootfs = 1;
+            *index += 1;
+            continue;
+        }
+        if (strcmp(flag, "--cap-add") == 0) {
+            if (*index + 1 >= argc) return -1;
+            if (security != NULL) {
+                int nr = security_cap_number(args[*index + 1]);
+                if (nr >= 0) security_cap_add(security, nr);
+            }
+            *index += 2;
+            continue;
+        }
+        if (strcmp(flag, "--cap-drop") == 0) {
+            if (*index + 1 >= argc) return -1;
+            if (security != NULL) {
+                int nr = security_cap_number(args[*index + 1]);
+                if (nr >= 0) security_cap_drop(security, nr);
             }
             *index += 2;
             continue;
@@ -180,9 +214,10 @@ int main(void) {
             size_t offset = 0;
             int index = 1;
 
+            spec.security = security_config_default();
             if (parse_limit_flags(args, argc, &index, &spec.resource_limits, &auto_remove,
-                                  spec.port_maps, &spec.port_map_count) != 0) {
-                printf("[error] usage: %s [--cpu SEC] [--mem MB] [--pids N] [-p HOST:CTR] [--rm] <name> <hostname> <rootfs> <command> [args...]\n\n",
+                                  spec.port_maps, &spec.port_map_count, &spec.security) != 0) {
+                printf("[error] usage: %s [flags] <name> <hostname> <rootfs> <cmd> [args...]\n\n",
                        args[0]);
                 continue;
             }
@@ -234,8 +269,10 @@ int main(void) {
             char container_id[CONTAINER_ID_LEN];
             int index = 1;
 
-            if (parse_limit_flags(args, argc, &index, &spec.resource_limits, NULL, NULL, NULL) != 0) {
-                printf("[error] usage: create [--cpu SEC] [--mem MB] [--pids N] [name] [hostname] [rootfs]\n\n");
+            spec.security = security_config_default();
+            if (parse_limit_flags(args, argc, &index, &spec.resource_limits, NULL, NULL, NULL,
+                                  &spec.security) != 0) {
+                printf("[error] usage: create [flags] [name] [hostname] [rootfs]\n\n");
                 continue;
             }
 
@@ -501,6 +538,12 @@ int main(void) {
                 continue;
             }
             container_unpause(args[1]);
+        } else if (strcmp(args[0], "security") == 0) {
+            if (argc < 2) {
+                printf("[error] usage: security <id>\n\n");
+                continue;
+            }
+            container_security_show(args[1]);
         } else if (strcmp(args[0], "help") == 0) {
             print_help();
         } else if (strcmp(args[0], "exit") == 0) {

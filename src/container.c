@@ -1,6 +1,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
@@ -152,7 +153,9 @@ static int save_metadata(void) {
         char port_maps_buf[128];
         bridge_serialize_port_maps(cursor->port_maps, cursor->port_map_count,
                                    port_maps_buf, sizeof(port_maps_buf));
-        fprintf(file, "%s\t%s\t%d\t%s\t%s\t%s\t%s\t%u\t%u\t%u\t%ld\t%ld\t%d\t%s\t%s\t%s\t%s\t%s\n",
+        fprintf(file,
+                "%s\t%s\t%d\t%s\t%s\t%s\t%s\t%u\t%u\t%u\t%ld\t%ld\t%d\t%s\t%s\t%s\t%s\t%s"
+                "\t%d\t%d\t%d\t%" PRIx64 "\n",
                 cursor->id,
                 cursor->name,
                 (int)cursor->pid,
@@ -170,7 +173,12 @@ static int save_metadata(void) {
                 cursor->image_ref,
                 cursor->ip_address,
                 cursor->veth_host,
-                port_maps_buf);
+                port_maps_buf,
+                /* fields 18-21: security */
+                cursor->security.privileged,
+                cursor->security.seccomp_enabled,
+                cursor->security.readonly_rootfs,
+                cursor->security.cap_keep);
     }
 
     if (fclose(file) != 0) {
@@ -548,7 +556,7 @@ int container_manager_init(void) {
     }
 
     while (fgets(line, sizeof(line), file) != NULL) {
-        char *fields[18];
+        char *fields[22];
         Container *container = NULL;
         int index = 0;
 
@@ -557,7 +565,7 @@ int container_manager_init(void) {
            (e.g. empty log_path or image_ref) are not silently skipped. */
         {
             char *p = line;
-            while (index < 18) {
+            while (index < 22) {
                 fields[index++] = p;
                 char *tab = strchr(p, '\t');
                 if (tab == NULL) break;
@@ -617,6 +625,15 @@ int container_manager_init(void) {
         if (index >= 18 && fields[17][0] != '\0') {
             container->port_map_count =
                 bridge_parse_port_maps(fields[17], container->port_maps, MAX_PORT_MAPS);
+        }
+
+        /* Security fields (added in module 10; absent in older metadata → defaults). */
+        container->security = security_config_default();
+        if (index >= 22) {
+            container->security.privileged      = atoi(fields[18]);
+            container->security.seccomp_enabled  = atoi(fields[19]);
+            container->security.readonly_rootfs  = atoi(fields[20]);
+            container->security.cap_keep         = (uint64_t)strtoull(fields[21], NULL, 16);
         }
 
         bridge_mark_ip_used(container->ip_address);
@@ -696,6 +713,7 @@ int container_create(const ContainerSpec *spec, char *out_id, size_t out_id_size
     container->ip_address[0] = '\0';
     container->veth_host[0]  = '\0';
     container->port_map_count = 0;
+    container->security = security_config_default();
     if (spec != NULL) {
         container->resource_limits = spec->resource_limits;
         (void)normalize_resource_limits(&container->resource_limits);
@@ -704,6 +722,7 @@ int container_create(const ContainerSpec *spec, char *out_id, size_t out_id_size
             memcpy(container->port_maps, spec->port_maps, (size_t)n * sizeof(PortMapping));
             container->port_map_count = n;
         }
+        container->security = spec->security;
     }
 
     if (filesystem_prepare_rootfs(requested_rootfs, container->rootfs, sizeof(container->rootfs)) != 0) {
@@ -847,13 +866,14 @@ static int start_container_by_id(const char *id, int schedule_target) {
 
     memset(&namespace_config, 0, sizeof(namespace_config));
     memset(&start_result, 0, sizeof(start_result));
-    namespace_config.hostname       = container->hostname;
-    namespace_config.rootfs         = container->rootfs;
-    namespace_config.command_line   = container->command_line;
+    namespace_config.hostname        = container->hostname;
+    namespace_config.rootfs          = container->rootfs;
+    namespace_config.command_line    = container->command_line;
     namespace_config.resource_limits = container->resource_limits;
-    namespace_config.log_fd         = -1;
-    namespace_config.net_setup      = container_net_setup;
-    namespace_config.net_setup_data = container;
+    namespace_config.security        = container->security;
+    namespace_config.log_fd          = -1;
+    namespace_config.net_setup       = container_net_setup;
+    namespace_config.net_setup_data  = container;
 
     if (container->log_path[0] != '\0') {
         namespace_config.log_fd = open(container->log_path,
@@ -886,6 +906,17 @@ static int start_container_by_id(const char *id, int schedule_target) {
     container->state      = STATE_RUNNING;
     container->started_at = time(NULL);
     container->exit_code  = -1;
+
+    /* Raise OOM kill priority so the kernel reclaims container memory first
+     * under host memory pressure — mirrors Docker's oom_score_adj handling. */
+    {
+        char oom_path[64];
+        FILE *oom_f;
+        snprintf(oom_path, sizeof(oom_path),
+                 "/proc/%d/oom_score_adj", (int)container->pid);
+        oom_f = fopen(oom_path, "w");
+        if (oom_f) { fputs("500\n", oom_f); fclose(oom_f); }
+    }
 
     /* Apply port forwards now that we have the container IP */
     if (container->ip_address[0] != '\0') {
@@ -1621,6 +1652,11 @@ int container_inspect(const char *id) {
         printf("  \"Isolation\"  : \"%s\",\n", namespace_profile());
         printf("  \"Filesystem\" : \"%s\",\n", filesystem_profile());
         printf("  \"Resources\"  : \"%s\",\n", resource_profile());
+        {
+            char sec_buf[640];
+            security_format_inspect(&container->security, sec_buf, sizeof(sec_buf));
+            printf("  \"SecurityProfile\" : %s,\n", sec_buf);
+        }
         printf("  \"NetworkSettings\" : {\n");
         printf("    \"Profile\"   : \"%s\",\n", network_profile());
         printf("    \"Bridge\"    : \"%s\",\n",
@@ -1946,6 +1982,29 @@ int container_logs_follow(const char *id) {
     }
 
     fclose(f);
+    return 0;
+}
+
+int container_security_show(const char *id) {
+    Container *container = NULL;
+
+    if (id == NULL || id[0] == '\0') {
+        printf("[error] usage: security <id>\n\n");
+        return -1;
+    }
+
+    poll_states();
+    container = find_container(id);
+    if (container == NULL) {
+        printf("[error] container %s not found\n\n", id);
+        return -1;
+    }
+
+    printf("\nSecurity profile: %s\n", container->id);
+    security_print_detail(&container->security);
+    printf("\n");
+
+    log_event("%s SECURITY INSPECTED", container->id);
     return 0;
 }
 

@@ -8,6 +8,7 @@
 #include "bridge.h"
 #include "image.h"
 #include "resource.h"
+#include "security.h"
 
 #define CONTAINER_ID_LEN 64
 #define CONTAINER_NAME_LEN 64
@@ -24,11 +25,12 @@ typedef enum {
 } ContainerState;
 
 typedef struct {
-    const char *name;
-    const char *hostname;
-    const char *rootfs;
-    const char *command_line;
+    const char   *name;
+    const char   *hostname;
+    const char   *rootfs;
+    const char   *command_line;
     ResourceConfig resource_limits;
+    SecurityConfig security;
     PortMapping    port_maps[MAX_PORT_MAPS];
     int            port_map_count;
 } ContainerSpec;
@@ -47,6 +49,7 @@ typedef struct Container {
     char              veth_host[16];            /* "" or "vethXXXX" host-side interface */
     PortMapping       port_maps[MAX_PORT_MAPS];
     int               port_map_count;
+    SecurityConfig    security;
     ContainerState    state;
     time_t            started_at;
     time_t            stopped_at;
@@ -83,6 +86,7 @@ int container_logs_follow(const char *id);
 int container_exec(const char *id, const char *command_line);
 int container_pause(const char *id);
 int container_unpause(const char *id);
+int container_security_show(const char *id);
 
 /* Ctrl+C handling for watch loops / CLI. */
 void container_request_interrupt(void);

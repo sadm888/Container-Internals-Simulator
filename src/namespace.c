@@ -15,6 +15,7 @@
 #include "namespace.h"
 #include "network.h"
 #include "resource.h"
+#include "security.h"
 
 /* ── wire protocol on continue_pipe ────────────────────────────────────
  * Parent writes one ContinueToken after user-namespace mapping and veth
@@ -31,6 +32,7 @@ typedef struct {
     const char    *rootfs;
     const char    *command_line;
     ResourceConfig resource_limits;
+    SecurityConfig security;
     int            status_fd;       /* child writes NamespaceStatus here    */
     int            continue_fd;     /* child reads  ContinueToken here      */
     int            exec_fd;         /* child writes errno here if execvp fails (CLOEXEC) */
@@ -179,11 +181,39 @@ static int namespace_child(void *arg) {
         close(ca->status_fd); return 1;
     }
 
+    /* ── read-only rootfs (applied right after pivot_root) ── */
+    if (ca->security.readonly_rootfs && !ca->security.privileged) {
+        security_apply_readonly(); /* best-effort */
+    }
+
     if (mount(NULL, "/proc", NULL, MS_REMOUNT | MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL) != 0) {
         if (errno != EINVAL) {
             status.error_number = errno;
             (void)write(ca->status_fd, &status, sizeof(status));
             close(ca->status_fd); return 1;
+        }
+    }
+
+    /* ── mask dangerous /proc paths (mirrors Docker's masked paths list) ──
+     * Bind-mount /dev/null over paths that expose sensitive host kernel
+     * interfaces.  Best-effort: individual failures are silently ignored
+     * (the path may not exist in every rootfs).
+     */
+    if (!ca->security.privileged) {
+        static const char *masked[] = {
+            "/proc/sysrq-trigger",  /* arbitrary kernel actions (crash/reboot) */
+            "/proc/kcore",          /* raw physical memory dump                */
+            "/proc/keys",           /* kernel key-ring contents                */
+            "/proc/latency_stats",  /* scheduler latency data                  */
+            "/proc/timer_list",     /* kernel timer internals                  */
+            "/proc/timer_stats",    /* deprecated but still readable on older  */
+            "/proc/sched_debug",    /* scheduler state including host PIDs     */
+            "/proc/scsi",           /* SCSI host adapter details               */
+            NULL
+        };
+        int mi;
+        for (mi = 0; masked[mi] != NULL; mi++) {
+            mount("/dev/null", masked[mi], NULL, MS_BIND, NULL);
         }
     }
 
@@ -210,6 +240,16 @@ static int namespace_child(void *arg) {
         status.error_number = RESOURCE_ERROR_BASE + errno;
         (void)write(ca->status_fd, &status, sizeof(status));
         close(ca->status_fd); return 1;
+    }
+
+    /* ── security: capability drops then seccomp BPF filter ──
+     * Applied after resource limits so RLIMIT syscalls already fired.
+     * Both calls are best-effort; a user-namespace may restrict some
+     * bounding-set ops — we continue regardless.
+     */
+    if (!ca->security.privileged) {
+        security_apply_caps(&ca->security);     /* drop caps from bounding set + capset */
+        security_apply_seccomp(&ca->security);  /* install BPF deny-list via prctl      */
     }
 
     if (setpgid(0, 0) != 0) {
@@ -278,10 +318,11 @@ int namespace_start_container(const NamespaceConfig *config,
     if (fcntl(exec_pipe[1], F_SETFD, FD_CLOEXEC) != 0) goto fail_pipes;
 
     memset(&ca, 0, sizeof(ca));
-    ca.hostname      = config->hostname;
-    ca.rootfs        = config->rootfs;
-    ca.command_line  = config->command_line;
+    ca.hostname        = config->hostname;
+    ca.rootfs          = config->rootfs;
+    ca.command_line    = config->command_line;
     ca.resource_limits = config->resource_limits;
+    ca.security        = config->security;
     ca.status_fd       = status_pipe[1];
     ca.continue_fd     = continue_pipe[0];
     ca.exec_fd         = exec_pipe[1];
