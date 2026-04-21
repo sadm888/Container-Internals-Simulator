@@ -9,8 +9,8 @@ PASS=0
 FAIL=0
 ROOTFS="./rootfs/test-basic"
 
-pass() { echo "  [PASS] $1"; ((PASS++)); }
-fail() { echo "  [FAIL] $1"; ((FAIL++)); }
+pass() { echo "  [PASS] $1"; ((++PASS)); }
+fail() { echo "  [FAIL] $1"; ((++FAIL)); }
 
 run_cmd() {
     # Send command(s) to the simulator via stdin, capture output
@@ -21,7 +21,7 @@ echo "=== test_basic.sh ==="
 echo ""
 
 echo "--- create ---"
-out=$(printf 'create basic-test myhost %s /bin/sleep\nexit\n' "$ROOTFS" | "$BIN" 2>&1)
+out=$(printf 'create basic-test myhost %s\nexit\n' "$ROOTFS" | "$BIN" 2>&1)
 if echo "$out" | grep -q "created container-"; then
     pass "create returns container id"
 else
@@ -44,15 +44,25 @@ if echo "$out" | grep -q "$CID"; then
 else
     fail "list does not show container"
 fi
-if echo "$out" | grep -q "CREATED"; then
-    pass "state is CREATED after create"
+if echo "$out" | grep -q "Created"; then
+    pass "state is Created after create"
 else
-    fail "state is not CREATED"
+    fail "state is not Created"
 fi
-if echo "$out" | grep -q "UPTIME"; then
-    pass "list shows UPTIME column"
+if echo "$out" | grep -q "STATUS"; then
+    pass "list shows STATUS column"
 else
-    fail "list missing UPTIME column"
+    fail "list missing STATUS column"
+fi
+if echo "$out" | grep -q "PORTS"; then
+    pass "list shows PORTS column"
+else
+    fail "list missing PORTS column"
+fi
+if echo "$out" | grep -q "IP"; then
+    pass "list shows IP column"
+else
+    fail "list missing IP column"
 fi
 
 echo ""

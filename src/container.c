@@ -12,6 +12,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "bridge.h"
 #include "container.h"
 #include "filesystem.h"
 #include "image.h"
@@ -148,7 +149,10 @@ static int save_metadata(void) {
     }
 
     for (Container *cursor = head; cursor != NULL; cursor = cursor->next) {
-        fprintf(file, "%s\t%s\t%d\t%s\t%s\t%s\t%s\t%u\t%u\t%u\t%ld\t%ld\t%d\t%s\t%s\n",
+        char port_maps_buf[128];
+        bridge_serialize_port_maps(cursor->port_maps, cursor->port_map_count,
+                                   port_maps_buf, sizeof(port_maps_buf));
+        fprintf(file, "%s\t%s\t%d\t%s\t%s\t%s\t%s\t%u\t%u\t%u\t%ld\t%ld\t%d\t%s\t%s\t%s\t%s\t%s\n",
                 cursor->id,
                 cursor->name,
                 (int)cursor->pid,
@@ -163,7 +167,10 @@ static int save_metadata(void) {
                 (long)cursor->stopped_at,
                 cursor->exit_code,
                 cursor->log_path,
-                cursor->image_ref);
+                cursor->image_ref,
+                cursor->ip_address,
+                cursor->veth_host,
+                port_maps_buf);
     }
 
     if (fclose(file) != 0) {
@@ -173,9 +180,14 @@ static int save_metadata(void) {
     }
 
     if (rename(METADATA_FILE_TMP, METADATA_FILE) != 0) {
-        printf("[error] failed to finalize container metadata\n\n");
-        log_event("metadata save failed: rename");
-        return -1;
+        /* On Windows/DrvFs, rename over an open file fails with EACCES.
+           Unlink the stale target and retry once. */
+        unlink(METADATA_FILE);
+        if (rename(METADATA_FILE_TMP, METADATA_FILE) != 0) {
+            printf("[error] failed to finalize container metadata\n\n");
+            log_event("metadata save failed: rename");
+            return -1;
+        }
     }
 
     return 0;
@@ -218,6 +230,22 @@ static void format_wait_status(int status, char *buffer, size_t buffer_size) {
     snprintf(buffer, buffer_size, "status=%d", status);
 }
 
+/* Tear down veth and iptables rules for a container that is exiting or being stopped.
+ * Safe to call even when the bridge is not active or fields are empty. */
+static void cleanup_container_network(Container *container) {
+    if (container->ip_address[0] != '\0') {
+        int i;
+        for (i = 0; i < container->port_map_count; i++) {
+            bridge_del_port_forward(&container->port_maps[i], container->ip_address);
+        }
+    }
+    if (container->veth_host[0] != '\0') {
+        bridge_teardown_veth(container->veth_host);
+        container->veth_host[0]  = '\0';
+        container->ip_address[0] = '\0';
+    }
+}
+
 static int sync_container_state(Container *container) {
     int state_changed = 0;
     int status = 0;
@@ -245,6 +273,7 @@ static int sync_container_state(Container *container) {
         free_container_stack(container);
         container_scheduler_on_stopped(old_pid);
         resource_cleanup_cgroup(container->id);
+        cleanup_container_network(container);
         format_wait_status(status, reason, sizeof(reason));
         log_event("%s exited and was reaped by manager (%s)", container->id, reason);
         return 1;
@@ -259,6 +288,7 @@ static int sync_container_state(Container *container) {
         container->pid = -1;
         free_container_stack(container);
         resource_cleanup_cgroup(container->id);
+        cleanup_container_network(container);
         log_event("%s marked stopped after recovery check", container->id);
         state_changed = 1;
     }
@@ -366,6 +396,7 @@ static int wait_for_container_process(Container *container, int quiet) {
     container->state = STATE_STOPPED;
     free_container_stack(container);
     resource_cleanup_cgroup(container->id);
+    cleanup_container_network(container);
 
     if (save_metadata() != 0) {
         return -1;
@@ -378,7 +409,13 @@ static int wait_for_container_process(Container *container, int quiet) {
     return 0;
 }
 
-static int stop_container_process(Container *container, int quiet) {
+#define STOP_TIMEOUT_S 10   /* default SIGTERM grace period — mirrors docker stop */
+
+static int stop_container_process(Container *container, int quiet, int timeout_s) {
+    int reaped = 0;
+    int wstatus = 0;
+    int effective_timeout = (timeout_s > 0) ? timeout_s : STOP_TIMEOUT_S;
+
     if ((container->state != STATE_RUNNING && container->state != STATE_PAUSED) ||
         container->pid <= 0) {
         if (!quiet) {
@@ -387,30 +424,54 @@ static int stop_container_process(Container *container, int quiet) {
         return -1;
     }
 
-    /* Resume a paused container before killing so SIGKILL is delivered cleanly. */
+    /* Resume a paused container so signals reach it. */
     if (container->state == STATE_PAUSED) {
         kill(container->pid, SIGCONT);
     }
 
-    if (kill(container->pid, SIGKILL) != 0 && errno != ESRCH) {
-        if (!quiet) {
-            printf("[error] failed to stop %s\n\n", container->id);
+    /* Phase 1: SIGTERM + grace period (mirrors `docker stop`). */
+    if (!quiet) {
+        printf("[manager] stopping %s (SIGTERM, timeout %ds)...\n",
+               container->id, effective_timeout);
+    }
+    if (kill(container->pid, SIGTERM) == 0) {
+        struct timespec ts = {0, 100000000}; /* 100 ms */
+        int ticks = 0;
+        while (ticks < effective_timeout * 10) {
+            pid_t r = waitpid(container->pid, &wstatus, WNOHANG);
+            if (r > 0) { reaped = 1; break; }
+            if (r < 0 && errno != EINTR) break;
+            nanosleep(&ts, NULL);
+            ticks++;
         }
-        log_event("failed to stop %s (pid %d)", container->id, container->pid);
-        return -1;
     }
 
-    if (waitpid(container->pid, NULL, 0) < 0 && errno != ECHILD) {
+    /* Phase 2: SIGKILL if container is still alive. */
+    if (!reaped) {
         if (!quiet) {
-            printf("[error] failed to reap %s\n\n", container->id);
+            printf("[manager] %s did not exit gracefully — sending SIGKILL\n",
+                   container->id);
         }
-        log_event("failed to reap %s (pid %d)", container->id, container->pid);
-        return -1;
+        if (kill(container->pid, SIGKILL) != 0 && errno != ESRCH) {
+            if (!quiet) {
+                printf("[error] failed to stop %s\n\n", container->id);
+            }
+            log_event("failed to stop %s (pid %d)", container->id, container->pid);
+            return -1;
+        }
+        if (waitpid(container->pid, &wstatus, 0) < 0 && errno != ECHILD) {
+            if (!quiet) {
+                printf("[error] failed to reap %s\n\n", container->id);
+            }
+            log_event("failed to reap %s (pid %d)", container->id, container->pid);
+            return -1;
+        }
     }
 
     log_event("%s STOPPED (pid %d)", container->id, container->pid);
     container_scheduler_on_stopped(container->pid);
     resource_cleanup_cgroup(container->id);
+    cleanup_container_network(container);
     container->stopped_at = time(NULL);
     container->exit_code  = -2;
     container->pid   = -1;
@@ -448,6 +509,16 @@ static void print_container_banner(const Container *container, pid_t namespace_p
     printf("  fs mode  : %s\n", filesystem_profile());
     printf("  net mode : %s\n", network_profile());
     printf("  res mode : %s\n", resource_profile());
+    if (container->ip_address[0] != '\0') {
+        printf("  ip       : %s\n", container->ip_address);
+        printf("  veth     : %s\n", container->veth_host);
+    }
+    if (container->port_map_count > 0) {
+        char ports_buf[128];
+        bridge_serialize_port_maps(container->port_maps, container->port_map_count,
+                                   ports_buf, sizeof(ports_buf));
+        printf("  ports    : %s\n", ports_buf);
+    }
     if (namespace_pid > 0) {
         printf("  ns pid   : %d\n", (int)namespace_pid);
     }
@@ -477,16 +548,22 @@ int container_manager_init(void) {
     }
 
     while (fgets(line, sizeof(line), file) != NULL) {
-        char *fields[15];
-        char *token = NULL;
+        char *fields[18];
         Container *container = NULL;
         int index = 0;
 
         trim_newline(line);
-        token = strtok(line, "\t");
-        while (token != NULL && index < 15) {
-            fields[index++] = token;
-            token = strtok(NULL, "\t");
+        /* Use a tab-aware splitter instead of strtok so empty fields
+           (e.g. empty log_path or image_ref) are not silently skipped. */
+        {
+            char *p = line;
+            while (index < 18) {
+                fields[index++] = p;
+                char *tab = strchr(p, '\t');
+                if (tab == NULL) break;
+                *tab = '\0';
+                p = tab + 1;
+            }
         }
 
         if (index < 6) {
@@ -532,6 +609,17 @@ int container_manager_init(void) {
 
         copy_string(container->image_ref, sizeof(container->image_ref),
                     (index >= 15) ? fields[14] : "");
+
+        copy_string(container->ip_address, sizeof(container->ip_address),
+                    (index >= 16) ? fields[15] : "");
+        copy_string(container->veth_host, sizeof(container->veth_host),
+                    (index >= 17) ? fields[16] : "");
+        if (index >= 18 && fields[17][0] != '\0') {
+            container->port_map_count =
+                bridge_parse_port_maps(fields[17], container->port_maps, MAX_PORT_MAPS);
+        }
+
+        bridge_mark_ip_used(container->ip_address);
 
         (void)normalize_resource_limits(&container->resource_limits);
         container->stack = NULL;
@@ -605,9 +693,17 @@ int container_create(const ContainerSpec *spec, char *out_id, size_t out_id_size
     }
 
     memset(&container->resource_limits, 0, sizeof(container->resource_limits));
+    container->ip_address[0] = '\0';
+    container->veth_host[0]  = '\0';
+    container->port_map_count = 0;
     if (spec != NULL) {
         container->resource_limits = spec->resource_limits;
         (void)normalize_resource_limits(&container->resource_limits);
+        if (spec->port_map_count > 0) {
+            int n = spec->port_map_count < MAX_PORT_MAPS ? spec->port_map_count : MAX_PORT_MAPS;
+            memcpy(container->port_maps, spec->port_maps, (size_t)n * sizeof(PortMapping));
+            container->port_map_count = n;
+        }
     }
 
     if (filesystem_prepare_rootfs(requested_rootfs, container->rootfs, sizeof(container->rootfs)) != 0) {
@@ -690,6 +786,36 @@ void container_scheduler_refresh_targets(void) {
     }
 }
 
+/* Called by namespace_start_container between clone() and writing ContinueToken.
+ * Sets up veth pair if the bridge is up, fills cfg for the child. */
+static int container_net_setup(pid_t container_pid, NetConfig *cfg, void *userdata) {
+    Container *c = (Container *)userdata;
+    char host_veth[16], peer_veth[16];
+    char ip[16];
+
+    if (!bridge_is_up()) return 0;
+
+    if (bridge_alloc_ip(ip, sizeof(ip)) != 0) {
+        log_event("%s bridge IP allocation failed", c->id);
+        return 0; /* non-fatal: start without bridge */
+    }
+
+    if (bridge_setup_veth(c->id, container_pid, ip,
+                          host_veth, sizeof(host_veth),
+                          peer_veth, sizeof(peer_veth)) != 0) {
+        log_event("%s veth setup failed", c->id);
+        return 0; /* non-fatal */
+    }
+
+    snprintf(cfg->peer_veth, sizeof(cfg->peer_veth), "%s", peer_veth);
+    snprintf(cfg->ip,        sizeof(cfg->ip),        "%s", ip);
+    snprintf(cfg->gateway,   sizeof(cfg->gateway),   "%s", BRIDGE_IP);
+
+    snprintf(c->ip_address, sizeof(c->ip_address), "%s", ip);
+    snprintf(c->veth_host,  sizeof(c->veth_host),  "%s", host_veth);
+    return 0;
+}
+
 static int start_container_by_id(const char *id, int schedule_target) {
     Container *container = NULL;
     NamespaceConfig namespace_config;
@@ -721,11 +847,13 @@ static int start_container_by_id(const char *id, int schedule_target) {
 
     memset(&namespace_config, 0, sizeof(namespace_config));
     memset(&start_result, 0, sizeof(start_result));
-    namespace_config.hostname = container->hostname;
-    namespace_config.rootfs = container->rootfs;
-    namespace_config.command_line = container->command_line;
+    namespace_config.hostname       = container->hostname;
+    namespace_config.rootfs         = container->rootfs;
+    namespace_config.command_line   = container->command_line;
     namespace_config.resource_limits = container->resource_limits;
-    namespace_config.log_fd = -1;
+    namespace_config.log_fd         = -1;
+    namespace_config.net_setup      = container_net_setup;
+    namespace_config.net_setup_data = container;
 
     if (container->log_path[0] != '\0') {
         namespace_config.log_fd = open(container->log_path,
@@ -735,6 +863,10 @@ static int start_container_by_id(const char *id, int schedule_target) {
                       container->id, container->log_path);
         }
     }
+
+    /* Reset networking fields — will be filled by net_setup callback if bridge is up */
+    container->ip_address[0] = '\0';
+    container->veth_host[0]  = '\0';
 
     if (namespace_start_container(&namespace_config,
                                   container->stack,
@@ -755,6 +887,14 @@ static int start_container_by_id(const char *id, int schedule_target) {
     container->started_at = time(NULL);
     container->exit_code  = -1;
 
+    /* Apply port forwards now that we have the container IP */
+    if (container->ip_address[0] != '\0') {
+        int i;
+        for (i = 0; i < container->port_map_count; i++) {
+            bridge_add_port_forward(&container->port_maps[i], container->ip_address);
+        }
+    }
+
     if (resource_try_cgroup(container->id, &container->resource_limits, container->pid) == 0) {
         log_event("%s cgroup applied (mem=%uMB nproc=%u)",
                   container->id,
@@ -765,16 +905,27 @@ static int start_container_by_id(const char *id, int schedule_target) {
     }
 
     if (save_metadata() != 0) {
-        stop_container_process(container, 1);
+        stop_container_process(container, 1, 0);
         return -1;
     }
 
     printf("[manager] started %s\n", container->id);
     print_container_banner(container, start_result.namespace_pid);
-    log_event("%s STARTED (pid %d, ns_pid %d, isolation=%s, command=%s, cpu=%us mem=%uMB nproc=%u)",
+
+    /* Signal child to execvp — must happen AFTER banner is printed */
+    if (namespace_trigger_exec(&start_result) != 0) {
+        saved_errno = errno;
+        log_event("%s execvp failed inside container: %s", container->id, strerror(saved_errno));
+        printf("[error] command failed inside container: %s\n\n", strerror(saved_errno));
+        stop_container_process(container, 1, 0);
+        return -1;
+    }
+
+    log_event("%s STARTED (pid %d, ns_pid %d, ip=%s, isolation=%s, command=%s, cpu=%us mem=%uMB nproc=%u)",
               container->id,
               container->pid,
               start_result.namespace_pid,
+              container->ip_address[0] ? container->ip_address : "none",
               namespace_profile(),
               container->command_line,
               container->resource_limits.cpu_seconds,
@@ -844,7 +995,7 @@ int container_start(const char *id) {
     return start_container_by_id(id, 1);
 }
 
-int container_stop(const char *id) {
+int container_stop(const char *id, int timeout_s) {
     Container *container = NULL;
 
     if (id == NULL || id[0] == '\0') {
@@ -859,7 +1010,7 @@ int container_stop(const char *id) {
         return -1;
     }
 
-    return stop_container_process(container, 0);
+    return stop_container_process(container, 0, timeout_s);
 }
 
 int container_delete(const char *id) {
@@ -916,14 +1067,16 @@ int container_list(void) {
     printf("\n");
     printf("Isolation : %s\n", namespace_profile());
     printf("Filesystem: %s\n", filesystem_profile());
-    printf("%-16s %-16s %-8s %-10s %-12s %-24s %-24s\n",
-           "ID", "NAME", "PID", "STATE", "UPTIME", "COMMAND", "LIMITS");
-    printf("-----------------------------------------------------------------------------------------------\n");
+    printf("%-16s %-16s %-8s %-22s %-16s %-20s %-20s\n",
+           "ID", "NAME", "PID", "STATUS", "IP", "PORTS", "COMMAND");
+    printf("----------------------------------------------------------------------------------------------------------\n");
 
     for (Container *cursor = head; cursor != NULL; cursor = cursor->next) {
         char pid_text[16];
-        char uptime_text[24];
-        char limits_text[128];
+        char status_text[48];
+        char ports_text[64];
+        char uptime_buf[24];
+        const char *ip_text;
 
         if (cursor->pid > 0) {
             snprintf(pid_text, sizeof(pid_text), "%d", (int)cursor->pid);
@@ -931,24 +1084,55 @@ int container_list(void) {
             copy_string(pid_text, sizeof(pid_text), "-");
         }
 
-        if (cursor->state == STATE_RUNNING && cursor->started_at > 0) {
-            format_uptime(now - cursor->started_at, uptime_text, sizeof(uptime_text));
-        } else if (cursor->state == STATE_STOPPED &&
-                   cursor->started_at > 0 && cursor->stopped_at > 0) {
-            format_uptime(cursor->stopped_at - cursor->started_at, uptime_text, sizeof(uptime_text));
-        } else {
-            copy_string(uptime_text, sizeof(uptime_text), "-");
+        /* Docker-style STATUS: "Up 2m30s" / "Exited (0)" / "Paused" / "Created" */
+        switch (cursor->state) {
+        case STATE_RUNNING:
+            if (cursor->started_at > 0) {
+                format_uptime(now - cursor->started_at, uptime_buf, sizeof(uptime_buf));
+                snprintf(status_text, sizeof(status_text), "Up %s", uptime_buf);
+            } else {
+                copy_string(status_text, sizeof(status_text), "Up");
+            }
+            break;
+        case STATE_PAUSED:
+            if (cursor->started_at > 0) {
+                format_uptime(now - cursor->started_at, uptime_buf, sizeof(uptime_buf));
+                snprintf(status_text, sizeof(status_text), "Paused (%s)", uptime_buf);
+            } else {
+                copy_string(status_text, sizeof(status_text), "Paused");
+            }
+            break;
+        case STATE_STOPPED:
+            if (cursor->exit_code == -2) {
+                copy_string(status_text, sizeof(status_text), "Exited (killed)");
+            } else if (cursor->exit_code >= 0) {
+                snprintf(status_text, sizeof(status_text), "Exited (%d)", cursor->exit_code);
+            } else {
+                copy_string(status_text, sizeof(status_text), "Exited");
+            }
+            break;
+        default:
+            copy_string(status_text, sizeof(status_text), "Created");
+            break;
         }
 
-        resource_format_limits(&cursor->resource_limits, limits_text, sizeof(limits_text));
-        printf("%-16s %-16s %-8s %-10s %-12s %-24s %-24s\n",
+        ip_text = cursor->ip_address[0] ? cursor->ip_address : "-";
+
+        if (cursor->port_map_count > 0) {
+            bridge_serialize_port_maps(cursor->port_maps, cursor->port_map_count,
+                                       ports_text, sizeof(ports_text));
+        } else {
+            copy_string(ports_text, sizeof(ports_text), "-");
+        }
+
+        printf("%-16s %-16s %-8s %-22s %-16s %-20s %-20s\n",
                cursor->id,
                cursor->name,
                pid_text,
-               state_to_string(cursor->state),
-               uptime_text,
-               cursor->command_line,
-               limits_text);
+               status_text,
+               ip_text,
+               ports_text,
+               cursor->command_line);
         count++;
     }
 
@@ -990,7 +1174,7 @@ static void print_stats_row(const Container *container, const MonitorStats *stat
 
     rss_mb = (double)stats->rss_bytes / (1024.0 * 1024.0);
     vsize_mb = (double)stats->vsize_bytes / (1024.0 * 1024.0);
-    snprintf(state_text, sizeof(state_text), "%c", stats->state);
+    snprintf(state_text, sizeof(state_text), "%s", state_to_string(container->state));
 
     if (!has_cpu_pct) {
         snprintf(cpu_pct_text, sizeof(cpu_pct_text), "-");
@@ -1404,8 +1588,9 @@ int container_inspect(const char *id) {
             format_uptime(container->stopped_at - container->started_at,
                           uptime_buf, sizeof(uptime_buf));
         }
-        if (container->exit_code == -1) {
-            snprintf(exit_buf, sizeof(exit_buf), "running");
+        if (container->state == STATE_CREATED || container->state == STATE_RUNNING ||
+            container->state == STATE_PAUSED) {
+            snprintf(exit_buf, sizeof(exit_buf), "-");
         } else if (container->exit_code == -2) {
             snprintf(exit_buf, sizeof(exit_buf), "killed");
         } else {
@@ -1435,8 +1620,32 @@ int container_inspect(const char *id) {
         printf("  },\n");
         printf("  \"Isolation\"  : \"%s\",\n", namespace_profile());
         printf("  \"Filesystem\" : \"%s\",\n", filesystem_profile());
-        printf("  \"Network\"    : \"%s\",\n", network_profile());
-        printf("  \"Resources\"  : \"%s\"", resource_profile());
+        printf("  \"Resources\"  : \"%s\",\n", resource_profile());
+        printf("  \"NetworkSettings\" : {\n");
+        printf("    \"Profile\"   : \"%s\",\n", network_profile());
+        printf("    \"Bridge\"    : \"%s\",\n",
+               container->veth_host[0] ? BRIDGE_NAME : "");
+        printf("    \"IPAddress\" : \"%s\",\n",
+               container->ip_address[0] ? container->ip_address : "");
+        printf("    \"Gateway\"   : \"%s\",\n",
+               container->ip_address[0] ? BRIDGE_IP : "");
+        printf("    \"VethHost\"  : \"%s\",\n",
+               container->veth_host[0] ? container->veth_host : "");
+        printf("    \"Ports\"     : {");
+        if (container->port_map_count > 0) {
+            int pi;
+            printf("\n");
+            for (pi = 0; pi < container->port_map_count; pi++) {
+                const PortMapping *pm = &container->port_maps[pi];
+                printf("      \"%d/%s\" : [{\"HostIp\": \"0.0.0.0\", \"HostPort\": \"%d\"}]%s\n",
+                       (int)pm->container_port, pm->proto, (int)pm->host_port,
+                       (pi < container->port_map_count - 1) ? "," : "");
+            }
+            printf("    }");
+        } else {
+            printf("}");
+        }
+        printf("\n  }");
 
         if ((container->state == STATE_RUNNING || container->state == STATE_PAUSED) &&
             container->pid > 0) {
@@ -1444,6 +1653,7 @@ int container_inspect(const char *id) {
             printf(",\n  \"OomKills\"   : %ld", (oom_kills >= 0) ? oom_kills : 0);
             printf(",\n");
             print_proc_tree(container->pid);
+            printf("\n");
         } else {
             printf("\n");
         }
@@ -1521,8 +1731,7 @@ int container_exec(const char *id, const char *command_line) {
         for (i = 0; i < 2; i++) {
             if (ns_fds[i] >= 0) {
                 if (setns(ns_fds[i], ns_types[i]) != 0) {
-                    fprintf(stderr, "[exec] warning: could not enter %s namespace: %s\n",
-                            ns_names[i], strerror(errno));
+                    /* Best-effort on WSL/unprivileged — silently skip. */
                 }
                 close(ns_fds[i]);
             }
@@ -1670,11 +1879,120 @@ int container_logs(const char *id) {
     return 0;
 }
 
+int container_logs_follow(const char *id) {
+    Container *container = NULL;
+    FILE *f = NULL;
+    char buf[4096];
+    size_t n;
+
+    if (id == NULL || id[0] == '\0') {
+        printf("[error] usage: logs -f <id>\n\n");
+        return -1;
+    }
+
+    poll_states();
+    container = find_container(id);
+    if (container == NULL) {
+        printf("[error] container %s not found\n\n", id);
+        return -1;
+    }
+
+    if (container->log_path[0] == '\0') {
+        printf("[manager] %s has no log file (use runbg to capture output)\n\n", id);
+        return 0;
+    }
+
+    f = fopen(container->log_path, "r");
+    if (f == NULL) {
+        printf("[manager] log file not yet created for %s\n\n", id);
+        return 0;
+    }
+
+    if (isatty(STDOUT_FILENO)) {
+        printf("[hint] following logs for %s — press Ctrl+C to stop\n", id);
+    }
+    fflush(stdout);
+
+    while (1) {
+        /* Drain all available bytes from the file */
+        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+            fwrite(buf, 1, n, stdout);
+            fflush(stdout);
+        }
+        clearerr(f);
+
+        if (container_consume_interrupt()) {
+            printf("\n");
+            break;
+        }
+
+        /* Re-poll container state so we know when it's done */
+        poll_states();
+        container = find_container(id);
+        if (container == NULL || container->state == STATE_STOPPED) {
+            /* One final drain before exiting */
+            while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+                fwrite(buf, 1, n, stdout);
+                fflush(stdout);
+            }
+            break;
+        }
+
+        /* Wait 50ms before next poll */
+        {
+            struct timespec ts = {0, 50000000};
+            nanosleep(&ts, NULL);
+        }
+    }
+
+    fclose(f);
+    return 0;
+}
+
+int container_net_summary(void) {
+    int any_networked = 0;
+    char ports_buf[64];
+
+    poll_states();
+
+    printf("\n");
+    printf("  Bridge    : %-12s  %s\n", BRIDGE_NAME,
+           bridge_is_up() ? "UP" : "DOWN (run: net init)");
+    if (bridge_is_up()) {
+        printf("  Subnet    : 172.17.0.0/16\n");
+        printf("  Gateway   : %s\n", BRIDGE_IP);
+    }
+    printf("\n");
+    printf("  %-18s %-18s %-16s %-24s %-10s\n",
+           "CONTAINER", "NAME", "IP", "PORTS", "STATE");
+    printf("  -------------------------------------------------------------------------------------\n");
+
+    for (Container *c = head; c != NULL; c = c->next) {
+        if (c->ip_address[0] == '\0') continue;
+
+        if (c->port_map_count > 0) {
+            bridge_serialize_port_maps(c->port_maps, c->port_map_count,
+                                       ports_buf, sizeof(ports_buf));
+        } else {
+            ports_buf[0] = '\0';
+            snprintf(ports_buf, sizeof(ports_buf), "-");
+        }
+
+        printf("  %-18s %-18s %-16s %-24s %-10s\n",
+               c->id, c->name, c->ip_address, ports_buf,
+               state_to_string(c->state));
+        any_networked = 1;
+    }
+
+    if (!any_networked) {
+        printf("  (no containers with bridge networking)\n");
+    }
+    printf("\n");
+    return 0;
+}
+
 int container_net(const char *id) {
     Container *container = NULL;
-    char netns_path[128];
-    char netns_link[256];
-    ssize_t n;
 
     if (id == NULL || id[0] == '\0') {
         printf("[error] usage: net <id>\n\n");
@@ -1688,24 +2006,38 @@ int container_net(const char *id) {
         return -1;
     }
 
-    if (container->state != STATE_RUNNING || container->pid <= 0) {
-        printf("[manager] %s is not running\n\n", container->id);
-        return -1;
-    }
-
-    snprintf(netns_path, sizeof(netns_path), "/proc/%d/ns/net", (int)container->pid);
-    n = readlink(netns_path, netns_link, sizeof(netns_link) - 1);
-    if (n < 0) {
-        printf("[error] failed to read netns for %s\n\n", container->id);
-        return -1;
-    }
-    netns_link[n] = '\0';
-
     printf("\n");
     printf("  container : %s\n", container->id);
-    printf("  pid       : %d\n", (int)container->pid);
-    printf("  netns     : %s\n", netns_link);
+    printf("  state     : %s\n", state_to_string(container->state));
     printf("  profile   : %s\n", network_profile());
+
+    if (container->state == STATE_RUNNING && container->pid > 0) {
+        char netns_path[128];
+        char netns_link[256];
+        ssize_t n;
+        snprintf(netns_path, sizeof(netns_path), "/proc/%d/ns/net", (int)container->pid);
+        n = readlink(netns_path, netns_link, sizeof(netns_link) - 1);
+        if (n >= 0) {
+            netns_link[n] = '\0';
+            printf("  pid       : %d\n", (int)container->pid);
+            printf("  netns     : %s\n", netns_link);
+        }
+    }
+
+    if (container->ip_address[0] != '\0') {
+        printf("  ip        : %s\n", container->ip_address);
+        printf("  gateway   : %s\n", BRIDGE_IP);
+        printf("  veth-host : %s\n", container->veth_host);
+        printf("  bridge    : %s\n", BRIDGE_NAME);
+    } else {
+        printf("  ip        : (no bridge / loopback only)\n");
+    }
+    if (container->port_map_count > 0) {
+        char ports_buf[128];
+        bridge_serialize_port_maps(container->port_maps, container->port_map_count,
+                                   ports_buf, sizeof(ports_buf));
+        printf("  ports     : %s\n", ports_buf);
+    }
     printf("\n");
 
     return 0;
@@ -1718,7 +2050,7 @@ void cleanup_all_containers(void) {
 
     while (cursor != NULL) {
         if (cursor->state == STATE_RUNNING || cursor->state == STATE_PAUSED) {
-            stop_container_process(cursor, 1);
+            stop_container_process(cursor, 1, 5); /* short 5s timeout on shutdown */
         }
         cursor = cursor->next;
     }

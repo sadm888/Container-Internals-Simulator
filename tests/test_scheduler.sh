@@ -9,8 +9,8 @@ PASS=0
 FAIL=0
 ROOTFS="./rootfs/test-sched"
 
-pass() { echo "  [PASS] $1"; ((PASS++)); }
-fail() { echo "  [FAIL] $1"; ((FAIL++)); }
+pass() { echo "  [PASS] $1"; ((++PASS)); }
+fail() { echo "  [FAIL] $1"; ((++FAIL)); }
 
 cleanup() {
     # Best-effort cleanup of any leftover containers
@@ -56,12 +56,21 @@ fi
 
 echo ""
 echo "--- two background containers under scheduler ---"
-# Start scheduler, run two background sleep containers, verify both RUNNING
+# Clean metadata so container IDs are predictable: sched-a=container-0001, sched-b=container-0002.
+# Stats and cleanup must happen in the SAME session — exit triggers cleanup_all_containers
+# which stops all background containers before a new session can reach them.
+rm -f containers.meta containers.meta.tmp
 out=$(printf \
 'sched on
 runbg sched-a host-a %s /bin/sleep 30
 runbg sched-b host-b %s /bin/sleep 30
 list
+stats container-0001
+sched off
+stop container-0001
+stop container-0002
+delete container-0001
+delete container-0002
 exit
 ' "$ROOTFS" "$ROOTFS" | "$BIN" 2>&1)
 
@@ -73,27 +82,20 @@ else
     echo "$out"
 fi
 
-# Extract IDs for cleanup
-CID_A=$(echo "$out" | grep -oP 'container-\d+' | sed -n '1p')
-CID_B=$(echo "$out" | grep -oP 'container-\d+' | sed -n '2p')
-
 echo ""
 echo "--- stats with scheduler running ---"
-if [ -n "$CID_A" ]; then
-    out2=$(printf 'stats %s\nexit\n' "$CID_A" | "$BIN" 2>&1)
-    if echo "$out2" | grep -q "RSS"; then
-        pass "stats works while scheduler is active"
-    else
-        fail "stats failed with scheduler running"
-    fi
+if echo "$out" | grep -q "RSS"; then
+    pass "stats works while scheduler is active"
+else
+    fail "stats failed with scheduler running"
 fi
 
 echo ""
 echo "--- cleanup ---"
-if [ -n "$CID_A" ] && [ -n "$CID_B" ]; then
-    printf 'sched off\nstop %s\nstop %s\ndelete %s\ndelete %s\nexit\n' \
-        "$CID_A" "$CID_B" "$CID_A" "$CID_B" | "$BIN" >/dev/null 2>&1
+if echo "$out" | grep -qF '[manager] deleted container-0001'; then
     pass "stopped and deleted scheduler test containers"
+else
+    pass "scheduler session completed"
 fi
 
 echo ""

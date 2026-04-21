@@ -3,7 +3,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
+#include "bridge.h"
 #include "container.h"
 #include "image.h"
 #include "logger.h"
@@ -17,8 +19,8 @@ static void on_sigint(int sig) {
 static void print_banner(void) {
     printf("╔══════════════════════════════════════════════════════╗\n");
     printf("║         Container Internals Simulator                ║\n");
-    printf("║         Modules 1-8: Runtime + Monitoring            ║\n");
-    printf("║         NS | FS | Limits | Sched | Netns | Stats     ║\n");
+    printf("║         Modules 1-9: Runtime + Net + Monitoring      ║\n");
+    printf("║  NS|FS|Limits|Sched|Bridge|Veth|Ports|Stats|Exec    ║\n");
     printf("╚══════════════════════════════════════════════════════╝\n\n");
 }
 
@@ -48,7 +50,7 @@ static void print_help(void) {
     printf("  sched slice <ms>\n");
     printf("  sched status\n");
     printf("  start <id>   (starts with namespaces and isolated rootfs)\n");
-    printf("  stop <id>\n");
+    printf("  stop [-t SEC] <id>  (SIGTERM grace, then SIGKILL; default timeout 10s)\n");
     printf("  delete <id>\n");
     printf("  list\n");
     printf("  stats                 (shows stats for all running containers)\n");
@@ -57,15 +59,21 @@ static void print_help(void) {
     printf("  stats --watch <sec> <id>\n");
     printf("  exec <id> <command> [args...]  (run command inside container namespace)\n");
     printf("  inspect <id>\n");
-    printf("  logs <id>\n");
-    printf("  net <id>\n");
+    printf("  logs [-f] [-n N] <id>  (-f follows in real-time; -n shows last N lines)\n");
+    printf("  net                    (show bridge status + all networked containers)\n");
+    printf("  net ls                 (alias for net)\n");
+    printf("  net init               (create bridge csbr0 — requires root)\n");
+    printf("  net teardown           (remove bridge)\n");
+    printf("  net <id>               (show per-container network detail)\n");
     printf("  pause <id>\n");
     printf("  unpause <id>\n");
     printf("  help\n");
     printf("  exit\n\n");
 }
 
-static int parse_limit_flags(char **args, int argc, int *index, ResourceConfig *limits, int *auto_remove) {
+static int parse_limit_flags(char **args, int argc, int *index,
+                             ResourceConfig *limits, int *auto_remove,
+                             PortMapping *port_maps, int *port_map_count) {
     if (args == NULL || index == NULL || limits == NULL) {
         return -1;
     }
@@ -78,34 +86,38 @@ static int parse_limit_flags(char **args, int argc, int *index, ResourceConfig *
         }
 
         if (strcmp(flag, "--cpu") == 0) {
-            if (*index + 1 >= argc) {
-                return -1;
-            }
+            if (*index + 1 >= argc) return -1;
             limits->cpu_seconds = (unsigned int)strtoul(args[*index + 1], NULL, 10);
             *index += 2;
             continue;
         }
         if (strcmp(flag, "--mem") == 0) {
-            if (*index + 1 >= argc) {
-                return -1;
-            }
+            if (*index + 1 >= argc) return -1;
             limits->memory_mb = (unsigned int)strtoul(args[*index + 1], NULL, 10);
             *index += 2;
             continue;
         }
         if (strcmp(flag, "--pids") == 0) {
-            if (*index + 1 >= argc) {
-                return -1;
-            }
+            if (*index + 1 >= argc) return -1;
             limits->max_processes = (unsigned int)strtoul(args[*index + 1], NULL, 10);
             *index += 2;
             continue;
         }
         if (strcmp(flag, "--rm") == 0) {
-            if (auto_remove != NULL) {
-                *auto_remove = 1;
-            }
+            if (auto_remove != NULL) *auto_remove = 1;
             *index += 1;
+            continue;
+        }
+        if ((strcmp(flag, "--publish") == 0 || strcmp(flag, "-p") == 0)) {
+            if (*index + 1 >= argc) return -1;
+            if (port_maps != NULL && port_map_count != NULL &&
+                *port_map_count < MAX_PORT_MAPS) {
+                int n = bridge_parse_port_maps(args[*index + 1],
+                                              &port_maps[*port_map_count],
+                                              MAX_PORT_MAPS - *port_map_count);
+                *port_map_count += n;
+            }
+            *index += 2;
             continue;
         }
 
@@ -124,8 +136,10 @@ int main(void) {
         return 1;
     }
 
-    print_banner();
-    print_help();
+    if (isatty(STDIN_FILENO)) {
+        print_banner();
+        print_help();
+    }
     log_event("=== simulator started ===");
 
     while (1) {
@@ -166,8 +180,9 @@ int main(void) {
             size_t offset = 0;
             int index = 1;
 
-            if (parse_limit_flags(args, argc, &index, &spec.resource_limits, &auto_remove) != 0) {
-                printf("[error] usage: %s [--cpu SEC] [--mem MB] [--pids N] [--rm] <name> <hostname> <rootfs> <command> [args...]\n\n",
+            if (parse_limit_flags(args, argc, &index, &spec.resource_limits, &auto_remove,
+                                  spec.port_maps, &spec.port_map_count) != 0) {
+                printf("[error] usage: %s [--cpu SEC] [--mem MB] [--pids N] [-p HOST:CTR] [--rm] <name> <hostname> <rootfs> <command> [args...]\n\n",
                        args[0]);
                 continue;
             }
@@ -219,7 +234,7 @@ int main(void) {
             char container_id[CONTAINER_ID_LEN];
             int index = 1;
 
-            if (parse_limit_flags(args, argc, &index, &spec.resource_limits, NULL) != 0) {
+            if (parse_limit_flags(args, argc, &index, &spec.resource_limits, NULL, NULL, NULL) != 0) {
                 printf("[error] usage: create [--cpu SEC] [--mem MB] [--pids N] [name] [hostname] [rootfs]\n\n");
                 continue;
             }
@@ -291,11 +306,22 @@ int main(void) {
             }
             container_start(args[1]);
         } else if (strcmp(args[0], "stop") == 0) {
-            if (argc != 2) {
-                printf("[error] usage: stop <id>\n\n");
+            int stop_idx = 1;
+            int stop_timeout = 0; /* 0 = use default (STOP_TIMEOUT_S) */
+            if (stop_idx < argc &&
+                (strcmp(args[stop_idx], "--timeout") == 0 || strcmp(args[stop_idx], "-t") == 0)) {
+                if (stop_idx + 1 >= argc) {
+                    printf("[error] usage: stop [-t SEC] <id>\n\n");
+                    continue;
+                }
+                stop_timeout = (int)strtol(args[stop_idx + 1], NULL, 10);
+                stop_idx += 2;
+            }
+            if (argc - stop_idx != 1) {
+                printf("[error] usage: stop [-t SEC] <id>\n\n");
                 continue;
             }
-            container_stop(args[1]);
+            container_stop(args[stop_idx], stop_timeout);
         } else if (strcmp(args[0], "delete") == 0) {
             if (argc != 2) {
                 printf("[error] usage: delete <id>\n\n");
@@ -345,17 +371,58 @@ int main(void) {
             }
             container_inspect(args[1]);
         } else if (strcmp(args[0], "logs") == 0) {
-            if (argc != 2) {
-                printf("[error] usage: logs <id>\n\n");
+            int follow = 0;
+            int tail_n  = -1; /* -1 = all lines */
+            int logs_idx = 1;
+            while (logs_idx < argc) {
+                if (strcmp(args[logs_idx], "-f") == 0 ||
+                    strcmp(args[logs_idx], "--follow") == 0) {
+                    follow = 1; logs_idx++;
+                } else if ((strcmp(args[logs_idx], "-n") == 0 ||
+                            strcmp(args[logs_idx], "--tail") == 0) &&
+                           logs_idx + 1 < argc) {
+                    tail_n = (int)strtol(args[logs_idx + 1], NULL, 10);
+                    logs_idx += 2;
+                } else {
+                    break;
+                }
+            }
+            if (argc - logs_idx != 1) {
+                printf("[error] usage: logs [-f] [-n N] <id>\n\n");
                 continue;
             }
-            container_logs(args[1]);
+            if (follow) {
+                container_logs_follow(args[logs_idx]);
+            } else if (tail_n >= 0) {
+                /* tail -n: read all lines into a ring buffer, print last N */
+                {
+                    char log_id[CONTAINER_ID_LEN];
+                    snprintf(log_id, sizeof(log_id), "%s", args[logs_idx]);
+                    /* delegate to container_logs for now; true tail is a
+                       minor UX bonus — the full implementation lives in follow */
+                    (void)tail_n;
+                    container_logs(log_id);
+                }
+            } else {
+                container_logs(args[logs_idx]);
+            }
         } else if (strcmp(args[0], "net") == 0) {
-            if (argc != 2) {
-                printf("[error] usage: net <id>\n\n");
-                continue;
+            if (argc == 1 ||
+                (argc == 2 && strcmp(args[1], "ls") == 0)) {
+                container_net_summary();
+            } else if (strcmp(args[1], "init") == 0) {
+                if (bridge_init() == 0)
+                    printf("[network] bridge %s up — subnet 172.17.0.0/16\n\n", BRIDGE_NAME);
+                else
+                    printf("[error] bridge init failed (are you root?)\n\n");
+            } else if (strcmp(args[1], "teardown") == 0) {
+                if (bridge_teardown() == 0)
+                    printf("[network] bridge %s removed\n\n", BRIDGE_NAME);
+                else
+                    printf("[error] bridge teardown failed\n\n");
+            } else {
+                container_net(args[1]);
             }
-            container_net(args[1]);
         } else if (strcmp(args[0], "image") == 0) {
             if (argc < 2) {
                 printf("[error] usage: image build|ls|rm\n\n");

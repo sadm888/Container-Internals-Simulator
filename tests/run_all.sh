@@ -11,14 +11,14 @@ TOTAL_FAIL=0
 
 run_suite() {
     local script=$1
+    local exit_code=0
     echo ""
     echo "======================================"
-    bash "$script"
-    local exit_code=$?
+    bash "$script" || exit_code=$?
     if [ $exit_code -ne 0 ]; then
-        ((TOTAL_FAIL++))
+        ((++TOTAL_FAIL))
     else
-        ((TOTAL_PASS++))
+        ((++TOTAL_PASS))
     fi
 }
 
@@ -30,6 +30,7 @@ run_suite tests/test_isolation.sh
 run_suite tests/test_resources.sh
 run_suite tests/test_scheduler.sh
 run_suite tests/test_monitoring.sh
+run_suite tests/test_network.sh
 
 echo ""
 echo "======================================"

@@ -9,8 +9,8 @@ PASS=0
 FAIL=0
 ROOTFS="./rootfs/test-resources"
 
-pass() { echo "  [PASS] $1"; ((PASS++)); }
-fail() { echo "  [FAIL] $1"; ((FAIL++)); }
+pass() { echo "  [PASS] $1"; ((++PASS)); }
+fail() { echo "  [FAIL] $1"; ((++FAIL)); }
 
 echo "=== test_resources.sh ==="
 echo ""
@@ -64,17 +64,21 @@ fi
 
 echo ""
 echo "--- limits shown in inspect ---"
-out=$(printf 'create --cpu 10 --mem 128 --pids 16 res-inspect inspecthost %s /bin/sh\ninspect container-0001\nexit\n' \
+rm -f containers.meta containers.meta.tmp
+out=$(printf 'create --cpu 10 --mem 128 --pids 16 res-inspect inspecthost %s\nexit\n' \
      "$ROOTFS" | "$BIN" 2>&1)
-CID=$(echo "$out" | grep -oP 'container-\d+' | head -1)
+CID=$(echo "$out" | grep -F '[manager] created container-' | grep -oP 'container-\d+' | head -1)
 if [ -n "$CID" ]; then
     out2=$(printf 'inspect %s\nexit\n' "$CID" | "$BIN" 2>&1)
     if echo "$out2" | grep -q '"CpuSeconds"' && echo "$out2" | grep -q '"MemoryMB"'; then
         pass "resource limits visible in inspect output"
     else
         fail "limits not shown in inspect"
+        echo "    Got: $(echo "$out2" | grep -E 'CpuSeconds|MemoryMB' || true)"
     fi
     printf 'delete %s\nexit\n' "$CID" | "$BIN" >/dev/null 2>&1 || true
+else
+    fail "could not create container for inspect test"
 fi
 
 echo ""
