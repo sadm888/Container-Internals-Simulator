@@ -146,7 +146,7 @@ int network_setup_eth0(const NetConfig *cfg) {
     if (iface_rename(fd, cfg->peer_veth, "eth0") != 0) {
         close(fd); return -1;
     }
-    if (iface_set_ip(fd, "eth0", cfg->ip, "255.255.0.0") != 0) {
+    if (iface_set_ip(fd, "eth0", cfg->ip, "255.255.255.0") != 0) {
         close(fd); return -1;
     }
     if (iface_up(fd, "eth0") != 0) {

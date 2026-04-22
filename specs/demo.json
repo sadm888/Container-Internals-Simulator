@@ -1,0 +1,28 @@
+{
+  "name": "demo",
+  "services": {
+    "db": {
+      "image": "base",
+      "command": "/bin/sh -c 'echo db-started && sleep 30'",
+      "restart": "always",
+      "health_check": {
+        "exec": "/bin/true",
+        "interval_ms": 3000,
+        "retries": 3,
+        "start_period_ms": 500
+      }
+    },
+    "web": {
+      "image": "base",
+      "command": "/bin/sh -c 'echo web-started && sleep 25'",
+      "depends_on": ["db"],
+      "restart": "on-failure",
+      "health_check": {
+        "exec": "/bin/true",
+        "interval_ms": 4000,
+        "retries": 2,
+        "start_period_ms": 1000
+      }
+    }
+  }
+}

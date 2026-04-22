@@ -1,0 +1,44 @@
+{
+  "name": "webapp",
+  // Three-tier application: cache → db → web (startup order)
+  "services": {
+    "cache": {
+      "image": "base",
+      "command": "/bin/sh -c 'echo cache-ready && sleep 60'",
+      "restart": "always",
+      "max_restarts": 5,
+      "health_check": {
+        "exec": "/bin/true",
+        "interval_ms": 5000,
+        "retries": 3,
+        "start_period_ms": 500
+      }
+    },
+    "db": {
+      "image": "base",
+      "command": "/bin/sh -c 'echo db-ready && sleep 60'",
+      "depends_on": ["cache"],
+      "restart": "always",
+      "max_restarts": 5,
+      "health_check": {
+        "exec": "/bin/true",
+        "interval_ms": 5000,
+        "retries": 3,
+        "start_period_ms": 500
+      }
+    },
+    "web": {
+      "image": "base",
+      "command": "/bin/sh -c 'echo web-ready && sleep 60'",
+      "depends_on": ["db", "cache"],
+      "restart": "on-failure",
+      "max_restarts": 3,
+      "health_check": {
+        "exec": "/bin/true",
+        "interval_ms": 6000,
+        "retries": 2,
+        "start_period_ms": 1000
+      }
+    }
+  }
+}

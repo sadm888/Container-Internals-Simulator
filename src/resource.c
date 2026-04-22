@@ -167,6 +167,9 @@ int resource_try_cgroup(const char *container_id, const ResourceConfig *config, 
             rmdir(cgroup_path);
             return -1;
         }
+        /* Suppress swap so the memory limit can't be bypassed via swapping.
+         * Best-effort: swap accounting may not be available on all kernels. */
+        write_cgroup_file(cgroup_path, "memory.swap.max", "0\n");
     }
 
     if (config->max_processes != 0) {

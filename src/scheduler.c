@@ -115,6 +115,13 @@ static void *scheduler_thread_main(void *arg) {
         count = g_state.target_count;
 
         if (!enabled || count < 2) {
+            /* When scheduling is inactive or only one target remains, ensure
+             * no process is stuck in SIGSTOP (e.g. a peer exited while this
+             * process was paused during an active slice). */
+            for (size_t ci = 0; ci < count; ci++) {
+                if (g_state.targets[ci] > 0)
+                    (void)kill(g_state.targets[ci], SIGCONT);
+            }
             pthread_mutex_unlock(&g_state.mutex);
             nanosleep_ms(50);
             continue;

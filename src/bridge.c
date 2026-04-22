@@ -118,7 +118,7 @@ int bridge_alloc_ip(char *buf, size_t buf_size) {
 
 int bridge_setup_veth(const char *container_id,
                       pid_t       container_pid,
-                      const char *container_ip,
+                      const char *container_ip __attribute__((unused)),
                       char       *host_veth_out, size_t host_veth_size,
                       char       *peer_veth_out, size_t peer_veth_size) {
     char host[16], peer[16], pid_s[16];
