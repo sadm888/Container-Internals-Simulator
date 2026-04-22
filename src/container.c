@@ -502,10 +502,12 @@ static int stop_container_process(Container *container, int quiet, int timeout_s
     resource_cleanup_cgroup(container->id);
     cleanup_container_network(container);
     container->stopped_at = time(NULL);
-    container->exit_code  = -2;
+    container->exit_code  = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus)
+                          : 128 + WTERMSIG(wstatus);
     container->pid   = -1;
     container->state = STATE_STOPPED;
-    eventbus_emit(EVENT_CONTAINER_STOPPED, container->id, "killed", -2);
+    eventbus_emit(EVENT_CONTAINER_STOPPED, container->id, "killed",
+                  (long)container->exit_code);
     free_container_stack(container);
     save_metadata();
 
@@ -516,43 +518,93 @@ static int stop_container_process(Container *container, int quiet, int timeout_s
     return 0;
 }
 
+/* ── Unicode box constants (total line width = 62 chars + newline) ── */
+#define BOX_DASHES \
+    "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80" \
+    "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80" \
+    "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80" \
+    "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80" \
+    "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80" \
+    "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80" \
+    "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80" \
+    "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80" \
+    "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80" \
+    "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80" \
+    "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80" \
+    "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80"
+
+/* row: │  <label:10>  <value:46>│  (2+10+2+46+1 = 61 inner + 1 border = 62) */
+static void box_row(const char *label, const char *value) {
+    printf("\xe2\x94\x82  %-10s  %-46.46s\xe2\x94\x82\n", label, value);
+}
+
 static void print_container_banner(const Container *container, pid_t namespace_pid) {
-    char pid_text[16];
+    char pid_text[24];
+    char nspid_text[24];
     char limits_text[128];
 
-    if (container->pid > 0) {
+    if (container->pid > 0)
         snprintf(pid_text, sizeof(pid_text), "%d", (int)container->pid);
-    } else {
+    else
         copy_string(pid_text, sizeof(pid_text), "-");
+
+    if (namespace_pid > 0)
+        snprintf(nspid_text, sizeof(nspid_text), "%d", (int)namespace_pid);
+    else
+        nspid_text[0] = '\0';
+
+    resource_format_limits(&container->resource_limits, limits_text, sizeof(limits_text));
+
+    const char *state = state_to_string(container->state);
+
+    /* ── top border ── */
+    printf("\n\xe2\x95\xad" BOX_DASHES "\xe2\x95\xae\n");
+
+    /* ── id + state header ── */
+    /* inner = 60 chars: "  <id:36>  <state:18>  " but we do: 2+36+gap+state+pad */
+    printf("\xe2\x94\x82  %-36.36s%20.20s  \xe2\x94\x82\n", container->id, state);
+
+    /* ── separator ── */
+    printf("\xe2\x94\x9c" BOX_DASHES "\xe2\x94\xa4\n");
+
+    /* ── info rows ── */
+    box_row("name",    container->name);
+    box_row("hostname", container->hostname);
+
+    /* pid + ns-pid on one row */
+    if (nspid_text[0] != '\0') {
+        char pid_combo[64];
+        snprintf(pid_combo, sizeof(pid_combo), "%-18s  ns pid  %s", pid_text, nspid_text);
+        box_row("pid", pid_combo);
+    } else {
+        box_row("pid", pid_text);
     }
 
-    printf("\n");
-    printf("  id       : %s\n", container->id);
-    printf("  name     : %s\n", container->name);
-    printf("  pid      : %s\n", pid_text);
-    printf("  hostname : %s\n", container->hostname);
-    printf("  rootfs   : %s\n", container->rootfs);
-    printf("  command  : %s\n", container->command_line);
-    resource_format_limits(&container->resource_limits, limits_text, sizeof(limits_text));
-    printf("  limits   : %s\n", limits_text);
-    printf("  isolate  : %s\n", namespace_profile());
-    printf("  fs mode  : %s\n", filesystem_profile());
-    printf("  net mode : %s\n", network_profile());
-    printf("  res mode : %s\n", resource_profile());
+    box_row("command",  container->command_line);
+    box_row("rootfs",   container->rootfs);
+    box_row("image",    container->image_ref[0] ? container->image_ref : "-");
+    box_row("limits",   limits_text);
+    box_row("isolate",  namespace_profile());
+    box_row("fs",       filesystem_profile());
+    box_row("net",      network_profile());
+    box_row("res",      resource_profile());
+
     if (container->ip_address[0] != '\0') {
-        printf("  ip       : %s\n", container->ip_address);
-        printf("  veth     : %s\n", container->veth_host);
+        char net_info[64];
+        snprintf(net_info, sizeof(net_info), "%s  veth %s",
+                 container->ip_address, container->veth_host);
+        box_row("ip / veth", net_info);
     }
+
     if (container->port_map_count > 0) {
         char ports_buf[128];
         bridge_serialize_port_maps(container->port_maps, container->port_map_count,
                                    ports_buf, sizeof(ports_buf));
-        printf("  ports    : %s\n", ports_buf);
+        box_row("ports", ports_buf);
     }
-    if (namespace_pid > 0) {
-        printf("  ns pid   : %d\n", (int)namespace_pid);
-    }
-    printf("  state    : %s\n\n", state_to_string(container->state));
+
+    /* ── bottom border ── */
+    printf("\xe2\x95\xb0" BOX_DASHES "\xe2\x95\xaf\n\n");
 }
 
 static void print_start_error(const Container *container, int error_number) {
@@ -1105,6 +1157,11 @@ int container_delete(const char *id) {
         return -1;
     }
 
+    if (container->state == STATE_PAUSED) {
+        printf("[error] unpause %s before deleting it\n\n", container->id);
+        return -1;
+    }
+
     remove_container(container);
     if (save_metadata() != 0) {
         append_container(container);
@@ -1176,13 +1233,10 @@ int container_list(void) {
             }
             break;
         case STATE_STOPPED:
-            if (cursor->exit_code == -2) {
-                copy_string(status_text, sizeof(status_text), "Exited (killed)");
-            } else if (cursor->exit_code >= 0) {
+            if (cursor->exit_code >= 0)
                 snprintf(status_text, sizeof(status_text), "Exited (%d)", cursor->exit_code);
-            } else {
+            else
                 copy_string(status_text, sizeof(status_text), "Exited");
-            }
             break;
         default:
             copy_string(status_text, sizeof(status_text), "Created");
@@ -1215,6 +1269,27 @@ int container_list(void) {
 
     printf("\n");
     return 0;
+}
+
+/* ── CPU-delta helpers (shared by stats, stats_all, and stats --watch) ──── */
+
+typedef struct {
+    pid_t              pid;
+    double             cpu_seconds;
+    unsigned long long wall_ns;
+} CpuSample;
+
+static unsigned long long monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ULL
+         + (unsigned long long)ts.tv_nsec;
+}
+
+static int find_sample(CpuSample *samples, size_t count, pid_t pid) {
+    for (size_t i = 0; i < count; i++)
+        if (samples[i].pid == pid) return (int)i;
+    return -1;
 }
 
 static void print_stats_header(void) {
@@ -1277,7 +1352,10 @@ static void print_stats_row(const Container *container, const MonitorStats *stat
 
 int container_stats(const char *id) {
     Container *container = NULL;
-    MonitorStats stats;
+    MonitorStats s1, s2;
+    unsigned long long t1, t2;
+    double cpu_pct = 0.0;
+    int has_cpu_pct = 0;
 
     if (id == NULL || id[0] == '\0') {
         printf("[error] usage: stats <id>\n\n");
@@ -1297,23 +1375,61 @@ int container_stats(const char *id) {
         return -1;
     }
 
-    if (monitor_read(container->pid, &stats) != 0) {
-        printf("[error] failed to read stats for %s (pid %d)\n\n", container->id, (int)container->pid);
+    /* Take two samples 300 ms apart to compute instantaneous CPU%. */
+    if (monitor_read(container->pid, &s1) != 0) {
+        printf("[error] failed to read stats for %s\n\n", container->id);
         return -1;
+    }
+    t1 = monotonic_ns();
+    struct timespec delta_sleep = {0, 300000000L};
+    nanosleep(&delta_sleep, NULL);
+    if (monitor_read(container->pid, &s2) == 0) {
+        t2 = monotonic_ns();
+        double delta_cpu  = s2.cpu_seconds - s1.cpu_seconds;
+        double delta_wall = (double)(t2 - t1) / 1e9;
+        if (delta_wall > 0.0 && delta_cpu >= 0.0) {
+            cpu_pct = (delta_cpu / delta_wall) * 100.0;
+            has_cpu_pct = 1;
+        }
+    } else {
+        s2 = s1;
     }
 
     print_stats_header();
-    print_stats_row(container, &stats, 0, 0.0);
+    print_stats_row(container, &s2, has_cpu_pct, cpu_pct);
     printf("\n");
     return 0;
 }
 
 int container_stats_all(void) {
+    /* Collect first samples from all running containers, sleep 300 ms,
+     * then collect second samples to compute per-container CPU%. */
+    CpuSample first[64];
+    unsigned long long t1_ns, t2_ns;
+    int fc = 0;
     int any = 0;
 
     poll_states();
-    print_stats_header();
 
+    for (Container *cursor = head; cursor != NULL; cursor = cursor->next) {
+        MonitorStats s;
+        if ((cursor->state != STATE_RUNNING && cursor->state != STATE_PAUSED) ||
+            cursor->pid <= 0) continue;
+        if (monitor_read(cursor->pid, &s) != 0) continue;
+        if (fc < 64) {
+            first[fc].pid         = cursor->pid;
+            first[fc].cpu_seconds = s.cpu_seconds;
+            first[fc].wall_ns     = 0;
+            fc++;
+        }
+    }
+
+    t1_ns = monotonic_ns();
+    struct timespec delta_sleep = {0, 300000000L};
+    nanosleep(&delta_sleep, NULL);
+    t2_ns = monotonic_ns();
+
+    print_stats_header();
     for (Container *cursor = head; cursor != NULL; cursor = cursor->next) {
         MonitorStats stats;
 
@@ -1328,7 +1444,20 @@ int container_stats_all(void) {
 
         metrics_update_mem_highwater(
             (unsigned long)(stats.rss_bytes / (1024 * 1024)));
-        print_stats_row(cursor, &stats, 0, 0.0);
+
+        double cpu_pct = 0.0;
+        int has_cpu_pct = 0;
+        int fi = find_sample(first, (size_t)fc, cursor->pid);
+        if (fi >= 0) {
+            double delta_cpu  = stats.cpu_seconds - first[fi].cpu_seconds;
+            double delta_wall = (double)(t2_ns - t1_ns) / 1e9;
+            if (delta_wall > 0.0 && delta_cpu >= 0.0) {
+                cpu_pct = (delta_cpu / delta_wall) * 100.0;
+                has_cpu_pct = 1;
+            }
+        }
+
+        print_stats_row(cursor, &stats, has_cpu_pct, cpu_pct);
         any = 1;
     }
 
@@ -1338,27 +1467,6 @@ int container_stats_all(void) {
 
     printf("\n");
     return 0;
-}
-
-typedef struct {
-    pid_t pid;
-    double cpu_seconds;
-    unsigned long long wall_ns;
-} CpuSample;
-
-static unsigned long long monotonic_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (unsigned long long)ts.tv_sec * 1000000000ULL + (unsigned long long)ts.tv_nsec;
-}
-
-static int find_sample(CpuSample *samples, size_t count, pid_t pid) {
-    for (size_t i = 0; i < count; i++) {
-        if (samples[i].pid == pid) {
-            return (int)i;
-        }
-    }
-    return -1;
 }
 
 static void sleep_interval(unsigned int interval_sec) {
@@ -1863,6 +1971,85 @@ int container_exec(const char *id, const char *command_line) {
     return 0;
 }
 
+/* ── orchestrator helpers ────────────────────────────────────────────────── */
+
+int container_get_info(const char *id, ContainerState *state,
+                       int *exit_code, pid_t *pid) {
+    poll_states();
+    Container *c = find_container(id);
+    if (!c) return -1;
+    if (state)     *state     = c->state;
+    if (exit_code) *exit_code = c->exit_code;
+    if (pid)       *pid       = c->pid;
+    return 0;
+}
+
+int container_exec_quiet(const char *id, const char *command_line) {
+    Container *container = NULL;
+    char cmd_buf[256];
+    char *argv[32];
+    char *token;
+    int argc = 0;
+    const char *ns_names[] = {"uts", "net", "mnt"};
+    int ns_types[]          = {CLONE_NEWUTS, CLONE_NEWNET, CLONE_NEWNS};
+    int ns_fds[3]           = {-1, -1, -1};
+    char ns_path[128];
+    pid_t child;
+    int status, i;
+
+    poll_states();
+    container = find_container(id);
+    if (!container || container->state != STATE_RUNNING || container->pid <= 0)
+        return -1;
+
+    if (snprintf(cmd_buf, sizeof(cmd_buf), "%s", command_line) >= (int)sizeof(cmd_buf))
+        return -1;
+
+    token = strtok(cmd_buf, " ");
+    while (token && argc < (int)(sizeof(argv)/sizeof(argv[0])) - 1) {
+        argv[argc++] = token;
+        token = strtok(NULL, " ");
+    }
+    if (argc == 0) return -1;
+    argv[argc] = NULL;
+
+    for (i = 0; i < 3; i++) {
+        snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/%s",
+                 (int)container->pid, ns_names[i]);
+        ns_fds[i] = open(ns_path, O_RDONLY);
+    }
+
+    child = fork();
+    if (child < 0) {
+        for (i = 0; i < 3; i++) if (ns_fds[i] >= 0) close(ns_fds[i]);
+        return -1;
+    }
+
+    if (child == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, STDOUT_FILENO); dup2(devnull, STDERR_FILENO); close(devnull); }
+
+        for (i = 0; i < 2; i++) {
+            if (ns_fds[i] >= 0) { setns(ns_fds[i], ns_types[i]); close(ns_fds[i]); }
+        }
+        if (ns_fds[2] >= 0) {
+            if (setns(ns_fds[2], CLONE_NEWNS) == 0) chdir("/");
+            else {
+                char rp[128];
+                snprintf(rp, sizeof(rp), "/proc/%d/root", (int)container->pid);
+                if (chdir(rp) == 0) { chroot("."); chdir("/"); }
+            }
+            close(ns_fds[2]);
+        }
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+
+    for (i = 0; i < 3; i++) if (ns_fds[i] >= 0) close(ns_fds[i]);
+    waitpid(child, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
 int container_pause(const char *id) {
     Container *container = NULL;
 
@@ -1963,6 +2150,60 @@ int container_logs(const char *id) {
     }
     printf("--- end ---\n\n");
     fclose(f);
+    return 0;
+}
+
+int container_logs_tail(const char *id, int n) {
+    Container *container = NULL;
+    FILE *f = NULL;
+    char **ring = NULL;
+    int head_idx = 0, count = 0;
+    char line[1024];
+
+    if (id == NULL || id[0] == '\0' || n <= 0) {
+        printf("[error] usage: logs -n N <id>\n\n");
+        return -1;
+    }
+
+    poll_states();
+    container = find_container(id);
+    if (container == NULL) {
+        printf("[error] container %s not found\n\n", id);
+        return -1;
+    }
+
+    if (container->log_path[0] == '\0') {
+        printf("[manager] %s has no log file (use runbg to capture output)\n\n", id);
+        return 0;
+    }
+
+    f = fopen(container->log_path, "r");
+    if (f == NULL) {
+        printf("[manager] log file not yet created for %s\n\n", id);
+        return 0;
+    }
+
+    ring = calloc((size_t)n, sizeof(char *));
+    if (ring == NULL) { fclose(f); return -1; }
+
+    while (fgets(line, sizeof(line), f) != NULL) {
+        free(ring[head_idx]);
+        ring[head_idx] = strdup(line);
+        head_idx = (head_idx + 1) % n;
+        if (count < n) count++;
+    }
+    fclose(f);
+
+    printf("\n--- logs (last %d): %s ---\n", count, container->log_path);
+    int start = (count < n) ? 0 : head_idx;
+    for (int i = 0; i < count; i++) {
+        int idx = (start + i) % n;
+        if (ring[idx]) printf("%s", ring[idx]);
+    }
+    printf("--- end ---\n\n");
+
+    for (int i = 0; i < n; i++) free(ring[i]);
+    free(ring);
     return 0;
 }
 
@@ -2179,4 +2420,168 @@ void cleanup_all_containers(void) {
     tail = NULL;
 
     scheduler_stop();
+}
+
+void container_prune_all(void) {
+    Container *cursor;
+    int deleted = 0;
+
+    poll_states();
+
+    cursor = head;
+    while (cursor != NULL) {
+        Container *next = cursor->next;
+        if (cursor->state != STATE_RUNNING && cursor->state != STATE_PAUSED) {
+            char id_copy[CONTAINER_ID_LEN];
+            copy_string(id_copy, sizeof(id_copy), cursor->id);
+            remove_container(cursor);
+            log_event("%s DELETED (prune)", id_copy);
+            eventbus_emit(EVENT_CONTAINER_DELETED, id_copy, NULL, 0);
+            free_container_stack(cursor);
+            free(cursor);
+            deleted++;
+        }
+        cursor = next;
+    }
+
+    /* reset sequence so next container starts from 0001 */
+    next_sequence = 1;
+    save_metadata();
+
+    printf("[manager] pruned %d container%s — counter reset to 1\n\n",
+           deleted, deleted == 1 ? "" : "s");
+}
+
+/* ── web API helpers ─────────────────────────────────────────────────────
+ * Called from a webserver thread — reads the list without a lock.
+ * Callers treat the output as a best-effort snapshot; slight staleness
+ * is acceptable for a live-monitoring dashboard.
+ * ─────────────────────────────────────────────────────────────────────── */
+
+int container_json_all(char *buf, int buflen) {
+    Container *c;
+    int written = 0;
+    int first   = 1;
+    time_t now  = time(NULL);
+
+    if (buf == NULL || buflen <= 2) return -1;
+
+    written += snprintf(buf + written, (size_t)(buflen - written), "[");
+
+    for (c = head; c != NULL && written < buflen - 512; c = c->next) {
+        char uptime_buf[24]  = "-";
+        char started_buf[32] = "-";
+        char exit_buf[16]    = "-";
+        char ports_buf[128]  = "";
+
+        if (c->started_at > 0) {
+            struct tm *tm_s = localtime(&c->started_at);
+            strftime(started_buf, sizeof(started_buf), "%Y-%m-%dT%H:%M:%S", tm_s);
+        }
+        if (c->state == STATE_RUNNING && c->started_at > 0) {
+            format_uptime(now - c->started_at, uptime_buf, sizeof(uptime_buf));
+        } else if (c->started_at > 0 && c->stopped_at > 0) {
+            format_uptime(c->stopped_at - c->started_at, uptime_buf, sizeof(uptime_buf));
+        }
+        if (c->state == STATE_STOPPED && c->exit_code >= 0)
+            snprintf(exit_buf, sizeof(exit_buf), "%d", c->exit_code);
+
+        if (c->port_map_count > 0)
+            bridge_serialize_port_maps(c->port_maps, c->port_map_count,
+                                       ports_buf, sizeof(ports_buf));
+
+        written += snprintf(buf + written, (size_t)(buflen - written),
+            "%s{"
+            "\"id\":\"%s\","
+            "\"name\":\"%s\","
+            "\"state\":\"%s\","
+            "\"pid\":%d,"
+            "\"ip\":\"%s\","
+            "\"ports\":\"%s\","
+            "\"uptime\":\"%s\","
+            "\"started_at\":\"%s\","
+            "\"exit_code\":\"%s\","
+            "\"command\":\"%s\","
+            "\"image\":\"%s\""
+            "}",
+            first ? "" : ",",
+            c->id,
+            c->name,
+            state_to_string(c->state),
+            (int)c->pid,
+            c->ip_address[0] ? c->ip_address : "",
+            ports_buf,
+            uptime_buf,
+            started_buf,
+            exit_buf,
+            c->command_line,
+            c->image_ref[0] ? c->image_ref : "");
+        first = 0;
+    }
+
+    if (written < buflen - 1) {
+        buf[written++] = ']';
+        buf[written]   = '\0';
+    }
+    return written;
+}
+
+/* ── per-container RSS snapshot for the dashboard ───────────────────── */
+/* Returns {"container-id":{rss_mb:N},...} — single read of /proc/pid/status */
+int container_stats_json_all(char *buf, int buflen) {
+    Container *c;
+    int written = 0;
+    int first   = 1;
+
+    if (buf == NULL || buflen <= 2) return -1;
+
+    written += snprintf(buf + written, (size_t)(buflen - written), "{");
+
+    for (c = head; c != NULL && written < buflen - 128; c = c->next) {
+        if (c->state != STATE_RUNNING || c->pid <= 0) continue;
+
+        unsigned long rss_kb = 0;
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%d/status", (int)c->pid);
+        FILE *f = fopen(path, "r");
+        if (f) {
+            char line[128];
+            while (fgets(line, sizeof(line), f)) {
+                if (strncmp(line, "VmRSS:", 6) == 0) {
+                    sscanf(line + 6, " %lu", &rss_kb);
+                    break;
+                }
+            }
+            fclose(f);
+        }
+
+        written += snprintf(buf + written, (size_t)(buflen - written),
+            "%s\"%s\":{\"rss_mb\":%lu}",
+            first ? "" : ",",
+            c->id,
+            rss_kb / 1024);
+        first = 0;
+    }
+
+    if (written < buflen - 1) {
+        buf[written++] = '}';
+        buf[written]   = '\0';
+    }
+    return written;
+}
+
+int container_send_signal(const char *id, int sig) {
+    Container *c;
+
+    if (id == NULL || id[0] == '\0') return -1;
+
+    for (c = head; c != NULL; c = c->next) {
+        if (strcmp(c->id, id) == 0) {
+            if (c->pid > 0 && c->state == STATE_RUNNING) {
+                return kill(c->pid, sig) == 0 ? 0 : -1;
+            }
+            return -1;
+        }
+    }
+    return -1;
 }

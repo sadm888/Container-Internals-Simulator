@@ -6,13 +6,16 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "alert.h"
 #include "bridge.h"
 #include "container.h"
 #include "eventbus.h"
 #include "image.h"
 #include "logger.h"
 #include "metrics.h"
+#include "orchestrator.h"
 #include "scheduler.h"
+#include "webserver.h"
 
 static void on_sigint(int sig) {
     (void)sig;
@@ -20,20 +23,32 @@ static void on_sigint(int sig) {
 }
 
 static void print_banner(void) {
-    printf("╔══════════════════════════════════════════════════════╗\n");
-    printf("║         Container Internals Simulator                ║\n");
-    printf("║  Modules 1-11: Runtime+Net+Monitor+Security+Events  ║\n");
-    printf("║  NS|FS|Limits|Sched|Bridge|Caps|Seccomp|EventBus   ║\n");
-    printf("╚══════════════════════════════════════════════════════╝\n\n");
+    printf("╔═══════════════════════════════════════════════════════════╗\n");
+    printf("║           Container Internals Simulator                   ║\n");
+    printf("║  Modules 1-12+Web: Runtime+Net+Monitor+Security+Orch     ║\n");
+    printf("║  NS|FS|Limits|Sched|Bridge|Caps|Seccomp|EventBus|Orch    ║\n");
+    printf("║  Dashboard: run 'web [port]' then open http://localhost   ║\n");
+    printf("╚═══════════════════════════════════════════════════════════╝\n\n");
 }
 
 static int parse_command(char *line, char **args, int max_args) {
     int count = 0;
-    char *token = strtok(line, " ");
+    char *p = line;
 
-    while (token != NULL && count < max_args) {
-        args[count++] = token;
-        token = strtok(NULL, " ");
+    while (*p && count < max_args) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+
+        if (*p == '"') {
+            p++;                    /* skip opening quote */
+            args[count++] = p;
+            while (*p && *p != '"') p++;
+            if (*p == '"') *p++ = '\0';   /* strip closing quote */
+        } else {
+            args[count++] = p;
+            while (*p && *p != ' ' && *p != '\t') p++;
+            if (*p) *p++ = '\0';
+        }
     }
 
     return count;
@@ -58,6 +73,7 @@ static void print_help(void) {
     printf("  start <id>   (starts with namespaces and isolated rootfs)\n");
     printf("  stop [-t SEC] <id>  (SIGTERM grace, then SIGKILL; default timeout 10s)\n");
     printf("  delete <id>\n");
+    printf("  prune                         delete all stopped containers + reset counter\n");
     printf("  list\n");
     printf("  stats                 (shows stats for all running containers)\n");
     printf("  stats <id>\n");
@@ -76,8 +92,34 @@ static void print_help(void) {
     printf("  security <id>          (show security profile: caps, seccomp, readonly)\n");
     printf("  events [-f] [-n N] [--type TYPE]  (show/stream events; filter by type)\n");
     printf("  metrics [--prometheus] (counters + latency; --prometheus: exposition fmt)\n");
+    printf("  orch run <spec.json>            start multi-container spec\n");
+    printf("  orch down                       stop all orchestrated services\n");
+    printf("  orch status | ps               show service health table\n");
+    printf("  orch restart <service>          restart one service\n");
+    printf("  orch validate <spec.json>       validate spec (no side effects)\n");
+    printf("  orch graph <spec.json>          print dependency graph\n");
+    printf("  web [port]                      start web dashboard (default port 8080)\n");
+    printf("  alert set <id> cpu <pct>        fire alert when CPU%% >= pct\n");
+    printf("  alert set <id> mem <MB>         fire alert when RSS >= MB\n");
+    printf("  alert ls                        list all configured alerts\n");
+    printf("  alert rm <id> [cpu|mem]         remove alert(s) for container\n");
     printf("  help\n");
     printf("  exit\n\n");
+}
+
+static void parse_image_ref(const char *ref, char *name, size_t name_sz,
+                            char *tag, size_t tag_sz) {
+    const char *colon = strchr(ref, ':');
+    if (colon != NULL) {
+        int nlen = (int)(colon - ref);
+        if (nlen >= (int)name_sz) nlen = (int)name_sz - 1;
+        memcpy(name, ref, (size_t)nlen);
+        name[nlen] = '\0';
+        snprintf(tag, tag_sz, "%s", colon + 1);
+    } else {
+        snprintf(name, name_sz, "%s", ref);
+        tag[0] = '\0';
+    }
 }
 
 static int parse_limit_flags(char **args, int argc, int *index,
@@ -173,6 +215,7 @@ int main(void) {
 
     eventbus_init();
     metrics_init();
+    metrics_load("metrics.state");
 
     if (container_manager_init() != 0) {
         return 1;
@@ -202,7 +245,11 @@ int main(void) {
                 continue;
             }
             printf("\n");
+            webserver_stop();
+            orch_down();
             cleanup_all_containers();
+            metrics_save("metrics.state");
+            eventbus_close();
             log_event("=== simulator stopped ===");
             break;
         }
@@ -246,11 +293,14 @@ int main(void) {
 
             command_line[0] = '\0';
             for (int i = index + 3; i < argc; i++) {
+                int needs_quotes = strchr(args[i], ' ') != NULL;
                 int written = snprintf(command_line + offset,
                                        sizeof(command_line) - offset,
-                                       "%s%s",
+                                       "%s%s%s%s",
                                        (i == index + 3) ? "" : " ",
-                                       args[i]);
+                                       needs_quotes ? "\"" : "",
+                                       args[i],
+                                       needs_quotes ? "\"" : "");
                 if (written < 0 || (size_t)written >= sizeof(command_line) - offset) {
                     offset = sizeof(command_line);
                     break;
@@ -381,6 +431,8 @@ int main(void) {
                 continue;
             }
             container_delete(args[1]);
+        } else if (strcmp(args[0], "prune") == 0) {
+            container_prune_all();
         } else if (strcmp(args[0], "list") == 0) {
             if (argc != 1) {
                 printf("[error] usage: list\n\n");
@@ -447,15 +499,7 @@ int main(void) {
             if (follow) {
                 container_logs_follow(args[logs_idx]);
             } else if (tail_n >= 0) {
-                /* tail -n: read all lines into a ring buffer, print last N */
-                {
-                    char log_id[CONTAINER_ID_LEN];
-                    snprintf(log_id, sizeof(log_id), "%s", args[logs_idx]);
-                    /* delegate to container_logs for now; true tail is a
-                       minor UX bonus — the full implementation lives in follow */
-                    (void)tail_n;
-                    container_logs(log_id);
-                }
+                container_logs_tail(args[logs_idx], tail_n);
             } else {
                 container_logs(args[logs_idx]);
             }
@@ -491,20 +535,9 @@ int main(void) {
                     continue;
                 }
                 {
-                    char img_name[64];
-                    char img_tag[32];
-                    const char *colon = strchr(args[2], ':');
-
-                    if (colon != NULL) {
-                        int nlen = (int)(colon - args[2]);
-                        if (nlen >= (int)sizeof(img_name)) nlen = (int)sizeof(img_name) - 1;
-                        memcpy(img_name, args[2], (size_t)nlen);
-                        img_name[nlen] = '\0';
-                        snprintf(img_tag, sizeof(img_tag), "%s", colon + 1);
-                    } else {
-                        snprintf(img_name, sizeof(img_name), "%s", args[2]);
-                        img_tag[0] = '\0';
-                    }
+                    char img_name[64]; char img_tag[32];
+                    parse_image_ref(args[2], img_name, sizeof(img_name),
+                                    img_tag, sizeof(img_tag));
                     image_build(img_name, img_tag, args[3]);
                 }
             } else if (strcmp(args[1], "tag") == 0) {
@@ -527,20 +560,9 @@ int main(void) {
                     continue;
                 }
                 {
-                    char img_name[64];
-                    char img_tag[32];
-                    const char *colon = strchr(args[2], ':');
-
-                    if (colon != NULL) {
-                        int nlen = (int)(colon - args[2]);
-                        if (nlen >= (int)sizeof(img_name)) nlen = (int)sizeof(img_name) - 1;
-                        memcpy(img_name, args[2], (size_t)nlen);
-                        img_name[nlen] = '\0';
-                        snprintf(img_tag, sizeof(img_tag), "%s", colon + 1);
-                    } else {
-                        snprintf(img_name, sizeof(img_name), "%s", args[2]);
-                        img_tag[0] = '\0';
-                    }
+                    char img_name[64]; char img_tag[32];
+                    parse_image_ref(args[2], img_name, sizeof(img_name),
+                                    img_tag, sizeof(img_tag));
                     image_remove(img_name, img_tag);
                 }
             } else {
@@ -613,6 +635,68 @@ int main(void) {
             } else {
                 metrics_print();
             }
+        } else if (strcmp(args[0], "orch") == 0) {
+            cmd_orch(argc, args);
+        } else if (strcmp(args[0], "alert") == 0) {
+            if (argc < 2) {
+                printf("[error] usage: alert set <id> cpu|mem <val> | alert ls | alert rm <id> [cpu|mem]\n\n");
+                continue;
+            }
+            if (strcmp(args[1], "ls") == 0) {
+                alert_list();
+            } else if (strcmp(args[1], "set") == 0) {
+                /* alert set <id> cpu|mem <threshold> */
+                if (argc < 5) {
+                    printf("[error] usage: alert set <id> cpu <pct> | alert set <id> mem <MB>\n\n");
+                    continue;
+                }
+                AlertMetric metric;
+                if (strcmp(args[3], "cpu") == 0)      metric = ALERT_CPU;
+                else if (strcmp(args[3], "mem") == 0) metric = ALERT_MEM;
+                else {
+                    printf("[error] metric must be 'cpu' or 'mem'\n\n");
+                    continue;
+                }
+                double threshold = strtod(args[4], NULL);
+                if (alert_set(args[2], metric, threshold) == 0) {
+                    printf("[alert] set: %s %s >= %.1f\n\n",
+                           args[2], args[3], threshold);
+                } else {
+                    printf("[error] failed to set alert: %s\n\n", strerror(errno));
+                }
+            } else if (strcmp(args[1], "rm") == 0) {
+                if (argc < 3) {
+                    printf("[error] usage: alert rm <id> [cpu|mem]\n\n");
+                    continue;
+                }
+                if (argc == 3) {
+                    /* remove both metrics for this container */
+                    alert_clear(args[2], ALERT_CPU);
+                    alert_clear(args[2], ALERT_MEM);
+                    printf("[alert] removed all alerts for %s\n\n", args[2]);
+                } else {
+                    AlertMetric metric = (strcmp(args[3], "mem") == 0) ? ALERT_MEM : ALERT_CPU;
+                    if (alert_clear(args[2], metric) == 0)
+                        printf("[alert] removed %s alert for %s\n\n", args[3], args[2]);
+                    else
+                        printf("[error] no %s alert found for %s\n\n", args[3], args[2]);
+                }
+            } else {
+                printf("[error] usage: alert set|ls|rm\n\n");
+            }
+        } else if (strcmp(args[0], "web") == 0) {
+            int port = 8080;
+            if (argc >= 2) port = (int)strtol(args[1], NULL, 10);
+            if (port <= 0 || port > 65535) {
+                printf("[error] invalid port: %d\n\n", port);
+                continue;
+            }
+            if (webserver_start(port) == 0) {
+                printf("[webserver] dashboard at http://localhost:%d — open in a browser\n\n", port);
+            } else {
+                printf("[error] could not start webserver on port %d: %s\n\n",
+                       port, strerror(errno));
+            }
         } else if (strcmp(args[0], "security") == 0) {
             if (argc < 2) {
                 printf("[error] usage: security <id>\n\n");
@@ -622,7 +706,11 @@ int main(void) {
         } else if (strcmp(args[0], "help") == 0) {
             print_help();
         } else if (strcmp(args[0], "exit") == 0) {
+            webserver_stop();
+            orch_down();
             cleanup_all_containers();
+            metrics_save("metrics.state");
+            eventbus_close();
             log_event("=== simulator stopped ===");
             printf("bye.\n");
             break;

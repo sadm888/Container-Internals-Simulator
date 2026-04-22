@@ -68,6 +68,7 @@ int  container_stop(const char *id, int timeout_s); /* timeout_s=0 → use defau
 int  container_delete(const char *id);
 int  container_list(void);
 void cleanup_all_containers(void);
+void container_prune_all(void);
 
 /* Scheduler integration (Module 6). */
 void container_scheduler_refresh_targets(void);
@@ -83,11 +84,22 @@ int container_inspect(const char *id);
 int container_net(const char *id);
 int container_net_summary(void);
 int container_logs(const char *id);
+int container_logs_tail(const char *id, int n);
 int container_logs_follow(const char *id);
 int container_exec(const char *id, const char *command_line);
 int container_pause(const char *id);
 int container_unpause(const char *id);
 int container_security_show(const char *id);
+
+/* Orchestrator helpers. */
+int container_get_info(const char *id, ContainerState *state,
+                       int *exit_code, pid_t *pid);
+int container_exec_quiet(const char *id, const char *command_line);
+
+/* Web API helpers. */
+int container_json_all(char *buf, int buflen);
+int container_stats_json_all(char *buf, int buflen);
+int container_send_signal(const char *id, int sig);
 
 /* Ctrl+C handling for watch loops / CLI. */
 void container_request_interrupt(void);

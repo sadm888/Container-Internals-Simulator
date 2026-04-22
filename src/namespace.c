@@ -51,7 +51,7 @@ typedef struct {
 static int build_exec_argv(const char *command_line,
                            char *buffer, size_t buffer_size,
                            char **argv, int max_args) {
-    char *token;
+    char *p;
     int   argc = 0;
 
     if (!command_line || !command_line[0] || !buffer || !buffer_size ||
@@ -60,12 +60,25 @@ static int build_exec_argv(const char *command_line,
     if (snprintf(buffer, buffer_size, "%s", command_line) >= (int)buffer_size) {
         errno = ENAMETOOLONG; return -1;
     }
-    token = strtok(buffer, " ");
-    while (token) {
+
+    p = buffer;
+    while (*p) {
+        while (*p == ' ') p++;
+        if (!*p) break;
         if (argc >= max_args - 1) { errno = E2BIG; return -1; }
-        argv[argc++] = token;
-        token = strtok(NULL, " ");
+
+        if (*p == '"') {
+            p++;                          /* skip opening quote */
+            argv[argc++] = p;
+            while (*p && *p != '"') p++;
+            if (*p == '"') *p++ = '\0';   /* strip closing quote */
+        } else {
+            argv[argc++] = p;
+            while (*p && *p != ' ') p++;
+            if (*p) *p++ = '\0';
+        }
     }
+
     if (argc == 0) { errno = EINVAL; return -1; }
     argv[argc] = NULL;
     return 0;
