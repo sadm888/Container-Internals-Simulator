@@ -1,6 +1,8 @@
 #include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #include "eventbus.h"
@@ -224,4 +226,74 @@ void metrics_print_prometheus(void) {
 
 #undef PCTR
 #undef PGAUGE
+}
+
+/* ── persistence ──────────────────────────────────────────────────────── */
+
+#define MF(name, field) fprintf(f, name "=%lu\n", snap.field)
+
+void metrics_save(const char *path) {
+    Metrics snap;
+    pthread_mutex_lock(&g_lock);
+    snap = g_metrics;
+    pthread_mutex_unlock(&g_lock);
+
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+
+    MF("containers_started",   containers_started);
+    MF("containers_stopped",   containers_stopped);
+    MF("containers_deleted",   containers_deleted);
+    MF("containers_paused",    containers_paused);
+    MF("containers_unpaused",  containers_unpaused);
+    MF("exec_launches",        exec_launches);
+    MF("oom_kills",            oom_kills);
+    MF("images_built",         images_built);
+    MF("images_removed",       images_removed);
+    MF("sched_toggles",        sched_toggles);
+    MF("events_total",         events_total);
+    MF("startup_count",        startup_count);
+    MF("startup_total_ms",     startup_total_ms);
+    MF("startup_max_ms",       startup_max_ms);
+    MF("startup_min_ms",       startup_min_ms);
+    MF("mem_highwater_mb",     mem_highwater_mb);
+
+    fclose(f);
+}
+
+#undef MF
+
+void metrics_load(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+
+    char line[128];
+    pthread_mutex_lock(&g_lock);
+    while (fgets(line, sizeof(line), f)) {
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        unsigned long val = strtoul(eq + 1, NULL, 10);
+
+#define TRY(name, field) if (strcmp(line, name) == 0) { g_metrics.field = val; continue; }
+        TRY("containers_started",   containers_started)
+        TRY("containers_stopped",   containers_stopped)
+        TRY("containers_deleted",   containers_deleted)
+        TRY("containers_paused",    containers_paused)
+        TRY("containers_unpaused",  containers_unpaused)
+        TRY("exec_launches",        exec_launches)
+        TRY("oom_kills",            oom_kills)
+        TRY("images_built",         images_built)
+        TRY("images_removed",       images_removed)
+        TRY("sched_toggles",        sched_toggles)
+        TRY("events_total",         events_total)
+        TRY("startup_count",        startup_count)
+        TRY("startup_total_ms",     startup_total_ms)
+        TRY("startup_max_ms",       startup_max_ms)
+        TRY("startup_min_ms",       startup_min_ms)
+        TRY("mem_highwater_mb",     mem_highwater_mb)
+#undef TRY
+    }
+    pthread_mutex_unlock(&g_lock);
+    fclose(f);
 }

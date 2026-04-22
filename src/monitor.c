@@ -118,6 +118,24 @@ static int parse_proc_status(pid_t pid, MonitorStats *out) {
     return 0;
 }
 
+static void parse_proc_io(pid_t pid, MonitorStats *out) {
+    char path[128];
+    char buffer[1024];
+    char *line, *saveptr;
+
+    snprintf(path, sizeof(path), "/proc/%d/io", (int)pid);
+    if (read_file_to_buffer(path, buffer, sizeof(buffer)) != 0) return;
+
+    line = strtok_r(buffer, "\n", &saveptr);
+    while (line != NULL) {
+        if (strncmp(line, "read_bytes:", 11) == 0)
+            out->read_bytes_io = strtoull(line + 11, NULL, 10);
+        else if (strncmp(line, "write_bytes:", 12) == 0)
+            out->write_bytes_io = strtoull(line + 12, NULL, 10);
+        line = strtok_r(NULL, "\n", &saveptr);
+    }
+}
+
 int monitor_read(pid_t pid, MonitorStats *out) {
     long page_size = 0;
     long hz = 0;
@@ -137,6 +155,7 @@ int monitor_read(pid_t pid, MonitorStats *out) {
 
     /* Best-effort. */
     (void)parse_proc_status(pid, out);
+    parse_proc_io(pid, out);
 
     page_size = sysconf(_SC_PAGESIZE);
     if (page_size > 0 && out->rss_pages > 0) {

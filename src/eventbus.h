@@ -46,6 +46,18 @@ typedef enum {
     EVENT_SCHED_ENABLED,
     EVENT_SCHED_DISABLED,
 
+    /* Orchestrator */
+    EVENT_ORCH_SPEC_UP,          /* value = service count            */
+    EVENT_ORCH_SPEC_DOWN,
+    EVENT_ORCH_SVC_STARTED,      /* detail = container_id            */
+    EVENT_ORCH_SVC_HEALTHY,
+    EVENT_ORCH_SVC_UNHEALTHY,    /* value = consecutive fail count   */
+    EVENT_ORCH_SVC_RESTARTED,    /* value = restart count            */
+
+    /* Threshold alerts */
+    EVENT_ALERT_FIRED,           /* detail = "cpu>80%" / "mem>512MB" */
+    EVENT_ALERT_RESOLVED,        /* detail = same as fired           */
+
     EVENT_TYPE_COUNT   /* sentinel — keep last */
 } EventType;
 
@@ -58,8 +70,12 @@ typedef struct {
     unsigned  seq;     /* monotonic sequence number     */
 } Event;
 
-/* Initialise — call once at startup before any emit. */
+/* Initialise — call once at startup before any emit.
+ * Replays persisted events from events.log into the ring buffer. */
 void eventbus_init(void);
+
+/* Flush and close the events.log file.  Call on clean shutdown. */
+void eventbus_close(void);
 
 /*
  * Emit a structured event.  Thread-safe.
@@ -98,5 +114,11 @@ unsigned eventbus_drain_from(unsigned from_seq);
  * to eventbus_print_recent).
  */
 void eventbus_print_filtered(int n, EventType type_filter);
+
+/*
+ * Serialise the most recent n events to buf as a JSON array.
+ * Returns the number of bytes written (excluding NUL), or -1 on error.
+ */
+int eventbus_json_recent(int n, char *buf, int buflen);
 
 #endif

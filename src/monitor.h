@@ -16,6 +16,9 @@ typedef struct {
     long threads;
     unsigned long rss_bytes;
     double cpu_seconds;
+    /* disk I/O — from /proc/<pid>/io (best-effort; requires kernel support) */
+    unsigned long long read_bytes_io;
+    unsigned long long write_bytes_io;
 } MonitorStats;
 
 int monitor_read(pid_t pid, MonitorStats *out);

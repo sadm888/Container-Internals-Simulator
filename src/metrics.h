@@ -52,4 +52,9 @@ const Metrics *metrics_snapshot(void);   /* returns pointer to live struct  */
 void           metrics_print(void);      /* table to stdout                 */
 void           metrics_print_prometheus(void); /* Prometheus exposition format */
 
+/* Persist counters to path (key=value lines). Call on clean shutdown. */
+void           metrics_save(const char *path);
+/* Load previously saved counters. Call after metrics_init(). */
+void           metrics_load(const char *path);
+
 #endif
