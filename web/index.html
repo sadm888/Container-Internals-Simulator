@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Container Internals Simulator</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23A0D2EB' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z'/></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&display=swap">
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.344.0/dist/umd/lucide.min.js"></script>
+</head>
+<body>
+
+<!-- ── Top navigation bar ──────────────────────────────────────────────── -->
+<header class="topbar">
+
+  <div class="topbar-title-row">
+    <span class="logo-name">Container Internals Simulator</span>
+    <span class="topbar-date" id="topbar-date"></span>
+  </div>
+
+  <nav class="topbar-nav">
+    <div class="tab-group">
+      <button type="button" class="tab active" data-view="containers">
+        <i data-lucide="layout-grid" class="icon-xs"></i>
+        Containers
+      </button>
+      <button type="button" class="tab" data-view="images">
+        <i data-lucide="layers" class="icon-xs"></i>
+        Images
+      </button>
+      <button type="button" class="tab" data-view="events">
+        <i data-lucide="activity" class="icon-xs"></i>
+        Events
+      </button>
+      <button type="button" class="tab" data-view="metrics">
+        <i data-lucide="bar-chart-2" class="icon-xs"></i>
+        Metrics
+      </button>
+    </div>
+  </nav>
+
+</header>
+
+<!-- ── Alert banner ────────────────────────────────────────────────────── -->
+<div id="alert-banner" class="alert-banner u-hidden">
+  <i data-lucide="alert-triangle" class="icon-xs"></i>
+  <strong>Alert</strong>
+  <span id="alert-content"></span>
+</div>
+
+<!-- ── Views ───────────────────────────────────────────────────────────── -->
+<main class="main">
+
+  <!-- ══ Containers ════════════════════════════════════════════════════ -->
+  <section id="view-containers" class="view active-view">
+
+    <div class="view-header">
+      <div class="view-header-left">
+        <h1 class="view-title">Containers</h1>
+        <span id="container-count" class="view-count u-hidden"></span>
+      </div>
+    </div>
+
+    <div class="view-body">
+      <div class="stat-row">
+        <div class="stat-card">
+          <div class="stat-icon green"><i data-lucide="activity" class="icon-xs"></i></div>
+          <div>
+            <div class="stat-value" id="m-running">—</div>
+            <div class="stat-label">Running</div>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon purple"><i data-lucide="play-circle" class="icon-xs"></i></div>
+          <div>
+            <div class="stat-value" id="m-started">—</div>
+            <div class="stat-label">Started</div>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon muted"><i data-lucide="stop-circle" class="icon-xs"></i></div>
+          <div>
+            <div class="stat-value" id="m-stopped">—</div>
+            <div class="stat-label">Stopped</div>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon red"><i data-lucide="alert-triangle" class="icon-xs"></i></div>
+          <div>
+            <div class="stat-value u-red" id="m-oom">—</div>
+            <div class="stat-label">OOM Kills</div>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon sky"><i data-lucide="timer" class="icon-xs"></i></div>
+          <div>
+            <div class="stat-value" id="m-avg">—</div>
+            <div class="stat-label">Avg Start</div>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon muted"><i data-lucide="clock" class="icon-xs"></i></div>
+          <div>
+            <div class="stat-value" id="m-uptime">—</div>
+            <div class="stat-label">Uptime</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="container-list" id="container-list">
+          <div class="empty-state">
+            <i data-lucide="loader-2" class="icon-xl anim-spin"></i>
+            <p>Loading containers…</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══ Images ════════════════════════════════════════════════════════ -->
+  <section id="view-images" class="view">
+    <div class="view-header">
+      <div class="view-header-left">
+        <h1 class="view-title">Images</h1>
+      </div>
+    </div>
+    <div class="view-body">
+      <div class="panel">
+        <div class="container-list" id="image-list">
+          <div class="empty-state">
+            <i data-lucide="layers" class="icon-xl"></i>
+            <p>No image data yet — start a container</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══ Events ════════════════════════════════════════════════════════ -->
+  <section id="view-events" class="view">
+    <div class="view-header">
+      <div class="view-header-left">
+        <h1 class="view-title">Events</h1>
+        <span id="event-count" class="view-count u-hidden"></span>
+      </div>
+    </div>
+    <div class="view-body">
+      <div class="panel">
+        <div class="charts-row">
+          <div class="chart-card">
+            <div class="chart-title">Running containers — last 30 ticks</div>
+            <div class="chart-wrap"><canvas id="chart-running"></canvas></div>
+          </div>
+          <div class="chart-card">
+            <div class="chart-title">Events per tick — last 30 ticks</div>
+            <div class="chart-wrap"><canvas id="chart-events"></canvas></div>
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="event-stream" id="event-list">
+          <div class="empty-state">
+            <i data-lucide="bell" class="icon-xl"></i>
+            <p>No events yet</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══ Metrics ═══════════════════════════════════════════════════════ -->
+  <section id="view-metrics" class="view">
+    <div class="view-header">
+      <div class="view-header-left">
+        <h1 class="view-title">Metrics</h1>
+      </div>
+    </div>
+    <div class="view-body">
+      <div class="panel">
+        <table class="metrics-table">
+          <tbody id="metrics-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<script src="app.js"></script>
+<script>if (typeof lucide !== "undefined") lucide.createIcons();</script>
+</body>
+</html>
