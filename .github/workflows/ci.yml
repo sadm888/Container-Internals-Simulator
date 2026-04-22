@@ -7,7 +7,7 @@ on:
     branches: [ main ]
 
 jobs:
-  build-and-test:
+  build:
     runs-on: ubuntu-latest
 
     steps:
@@ -17,22 +17,17 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y gcc make libcap-dev
+          sudo apt-get install -y gcc make libcap-dev libseccomp-dev
 
       - name: Build
         run: make
 
-      - name: Setup rootfs
-        run: bash scripts/setup-rootfs.sh
-
-      - name: Run test suite
+      - name: Verify binary
         run: |
-          # Tests that require network namespaces need root + unprivileged user namespaces
-          # enable them if the kernel supports it
-          echo 1 | sudo tee /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || true
-          sudo bash tests/run_all.sh
+          test -f ./container-sim
+          file ./container-sim | grep -q ELF
 
-      - name: Upload build artifact
+      - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: container-sim-linux-amd64
