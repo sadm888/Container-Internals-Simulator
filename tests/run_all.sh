@@ -33,6 +33,9 @@ run_suite tests/test_monitoring.sh
 run_suite tests/test_network.sh
 run_suite tests/test_security.sh
 run_suite tests/test_events.sh
+run_suite tests/test_orchestrator.sh
+run_suite tests/test_cli.sh
+run_suite tests/test_web.sh
 
 echo ""
 echo "======================================"

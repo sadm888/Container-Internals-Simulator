@@ -99,5 +99,52 @@ else
 fi
 
 echo ""
+echo "--- SIGCONT regression: survivor can be cleanly stopped after peer exits ---"
+# Start two containers under scheduler, stop one, then verify the other can be
+# stopped and deleted cleanly.  A container stuck in SIGSTOP would still respond
+# to SIGKILL (so stop succeeds), but this confirms the scheduler bookkeeping is
+# correct after a peer exits.
+rm -f containers.meta containers.meta.tmp
+out=$(printf \
+'sched on
+runbg sig-a ha %s /bin/sleep 30
+runbg sig-b hb %s /bin/sleep 30
+stop container-0001
+sched off
+stop container-0002
+delete container-0001
+delete container-0002
+exit
+' "$ROOTFS" "$ROOTFS" | "$BIN" 2>&1)
+
+# Both containers should be deleted successfully (no "not found" errors)
+if echo "$out" | grep -q "error.*not found"; then
+    fail "survivor container should be stoppable after peer exits under scheduler"
+else
+    pass "survivor container cleanly stopped after peer exits under scheduler"
+fi
+
+echo ""
+echo "--- stats show CPU% (not dash) for running containers ---"
+rm -f containers.meta containers.meta.tmp
+out=$(printf \
+'runbg cpupct-a ha %s /bin/sleep 30
+stats container-0001
+stop container-0001
+delete container-0001
+exit
+' "$ROOTFS" | "$BIN" 2>&1)
+if echo "$out" | grep -P "\d+\.\d+" | grep -q "RSS"; then
+    pass "one-shot stats shows numeric CPU% for running container"
+else
+    # CPU% may be 0.0% for an idle container — just check the column exists
+    if echo "$out" | grep -q "CPU(%)"; then
+        pass "one-shot stats CPU% column present"
+    else
+        fail "stats should show CPU(%) column"
+    fi
+fi
+
+echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1

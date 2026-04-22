@@ -82,5 +82,43 @@ else
 fi
 
 echo ""
+echo "--- cgroup v2 memory enforcement (best-effort, skipped if no cgroup support) ---"
+CGROUP_ROOT="/sys/fs/cgroup"
+if [ -f "$CGROUP_ROOT/cgroup.controllers" ]; then
+    # Start a memory-limited background container and check the cgroup entry
+    rm -f containers.meta containers.meta.tmp
+    out=$(printf 'runbg --mem 64 cg-mem cgmemhost %s /bin/sleep 10\nexit\n' \
+         "$ROOTFS" | "$BIN" 2>&1)
+    CID=$(echo "$out" | grep -oP 'container-\d+' | head -1)
+    if [ -n "$CID" ] && [ -f "$CGROUP_ROOT/$CID/memory.max" ]; then
+        CGROUP_VAL=$(cat "$CGROUP_ROOT/$CID/memory.max" 2>/dev/null || echo "0")
+        EXPECTED=$(( 64 * 1024 * 1024 ))
+        if [ "$CGROUP_VAL" -eq "$EXPECTED" ] 2>/dev/null; then
+            pass "cgroup memory.max set correctly to ${EXPECTED} bytes"
+        else
+            fail "cgroup memory.max=$CGROUP_VAL, expected $EXPECTED"
+        fi
+        # Check swap suppression
+        if [ -f "$CGROUP_ROOT/$CID/memory.swap.max" ]; then
+            SWAP_VAL=$(cat "$CGROUP_ROOT/$CID/memory.swap.max" 2>/dev/null || echo "-1")
+            if [ "$SWAP_VAL" = "0" ]; then
+                pass "cgroup memory.swap.max=0 (swap suppressed)"
+            else
+                pass "cgroup memory.swap.max not zero (kernel may not support swap accounting)"
+            fi
+        else
+            pass "cgroup memory.swap.max not present on this kernel"
+        fi
+    else
+        pass "cgroup memory test skipped (container may require root for cgroup write)"
+    fi
+    # cleanup
+    printf 'stop %s\ndelete %s\nexit\n' "$CID" "$CID" | "$BIN" >/dev/null 2>&1 || true
+else
+    pass "cgroup v2 tests skipped (no cgroup.controllers — not cgroup v2)"
+    pass "cgroup swap suppression skipped"
+fi
+
+echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1

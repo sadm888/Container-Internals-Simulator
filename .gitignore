@@ -9,6 +9,8 @@ containers.meta
 containers.meta.tmp
 images.meta
 images.meta.tmp
+events.log
+metrics.state
 logs/
 rootfs/
 /tmp/container-sim/
