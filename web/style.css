@@ -277,6 +277,10 @@ body {
   transition: box-shadow .2s, border-color .2s;
 }
 
+.stat-card > div:last-child {
+  min-width: 0;
+}
+
 .stat-card:hover {
   border-color: var(--border-md);
   box-shadow: 0 0 20px var(--purple-glow);
@@ -302,6 +306,8 @@ body {
   font-weight: 800;
   line-height: 1;
   color: var(--purple-lt);
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .stat-label {

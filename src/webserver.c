@@ -151,6 +151,10 @@ static void handle_connection(int fd) {
     char *qs = strchr(path, '?');
     if (qs) { *qs = '\0'; qs++; }
 
+    if (strncmp(path, "/api/", 5) == 0) {
+        container_refresh_state();
+    }
+
     if (strcmp(method, "OPTIONS") == 0) {
         const char *preflight =
             "HTTP/1.0 200 OK\r\n"

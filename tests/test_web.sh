@@ -100,6 +100,29 @@ else
 fi
 
 echo ""
+echo "--- realtime state refresh ---"
+cleanup
+
+(printf "web %d\n" "$PORT"; printf "runbg webtest webhost ./rootfs/test-basic /bin/sleep 1\n"; sleep 8; printf "exit\n") | "$BIN" >/dev/null 2>&1 &
+SIM_PID=$!
+
+for i in $(seq 1 25); do
+    body=$(curl -sf "http://localhost:${PORT}/api/containers" 2>/dev/null || true)
+    if echo "$body" | grep -q '"name":"webtest"'; then
+        break
+    fi
+    sleep 0.2
+done
+
+sleep 2
+body=$(curl -sf "http://localhost:${PORT}/api/containers" 2>/dev/null || echo "ERROR")
+if echo "$body" | grep -q '"name":"webtest".*"state":"STOPPED"'; then
+    pass "API refreshes container state after background exit"
+else
+    fail "container state stayed stale after exit: $body"
+fi
+
+echo ""
 echo "--- CORS headers ---"
 header=$(curl -sI "http://localhost:${PORT}/api/containers" | grep -i "Access-Control" || true)
 if echo "$header" | grep -qi "Access-Control-Allow-Origin"; then

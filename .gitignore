@@ -13,6 +13,7 @@ events.log
 metrics.state
 logs/
 rootfs/
+myrootfs/
 /tmp/container-sim/
 
 # editor

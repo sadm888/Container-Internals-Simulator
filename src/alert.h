@@ -46,5 +46,6 @@ int  alert_json(char *buf, int buflen);
  * Returns number of state transitions (fires + resolves).
  */
 int  alert_check(const char *id, double cpu_pct, double rss_mb);
+int  alert_check_sample(const char *id, int has_cpu_pct, double cpu_pct, double rss_mb);
 
 #endif

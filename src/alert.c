@@ -10,6 +10,37 @@
 static Alert           g_alerts[ALERT_MAX];
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static void json_escape_copy(char *dst, size_t dst_size, const char *src) {
+    size_t out = 0;
+
+    if (dst_size == 0) return;
+    if (src == NULL) {
+        dst[0] = '\0';
+        return;
+    }
+
+    for (size_t i = 0; src[i] != '\0' && out + 1 < dst_size; i++) {
+        unsigned char ch = (unsigned char)src[i];
+        if ((ch == '\\' || ch == '"') && out + 2 < dst_size) {
+            dst[out++] = '\\';
+            dst[out++] = (char)ch;
+        } else if (ch == '\n' && out + 2 < dst_size) {
+            dst[out++] = '\\';
+            dst[out++] = 'n';
+        } else if (ch == '\r' && out + 2 < dst_size) {
+            dst[out++] = '\\';
+            dst[out++] = 'r';
+        } else if (ch == '\t' && out + 2 < dst_size) {
+            dst[out++] = '\\';
+            dst[out++] = 't';
+        } else if (ch >= 0x20) {
+            dst[out++] = (char)ch;
+        }
+    }
+
+    dst[out] = '\0';
+}
+
 static const char *metric_name(AlertMetric m) {
     return (m == ALERT_CPU) ? "cpu" : "mem";
 }
@@ -136,6 +167,10 @@ int alert_json(char *buf, int buflen) {
         if (!g_alerts[i].active) continue;
         char thresh_str[24];
         char fired_buf[22] = "";
+        char id_json[sizeof(g_alerts[i].container_id) * 2];
+        char metric_json[16];
+        char thresh_json[48];
+        char fired_json[32];
 
         if (g_alerts[i].metric == ALERT_CPU)
             snprintf(thresh_str, sizeof(thresh_str), "%.1f%%", g_alerts[i].threshold);
@@ -147,6 +182,11 @@ int alert_json(char *buf, int buflen) {
             strftime(fired_buf, sizeof(fired_buf), "%Y-%m-%dT%H:%M:%S", t);
         }
 
+        json_escape_copy(id_json, sizeof(id_json), g_alerts[i].container_id);
+        json_escape_copy(metric_json, sizeof(metric_json), metric_name(g_alerts[i].metric));
+        json_escape_copy(thresh_json, sizeof(thresh_json), thresh_str);
+        json_escape_copy(fired_json, sizeof(fired_json), fired_buf);
+
         written += snprintf(buf + written, (size_t)(buflen - written),
             "%s{"
             "\"container_id\":\"%s\","
@@ -156,11 +196,11 @@ int alert_json(char *buf, int buflen) {
             "\"fired_at\":\"%s\""
             "}",
             first ? "" : ",",
-            g_alerts[i].container_id,
-            metric_name(g_alerts[i].metric),
-            thresh_str,
+            id_json,
+            metric_json,
+            thresh_json,
             g_alerts[i].firing ? "true" : "false",
-            fired_buf);
+            fired_json);
         first = 0;
     }
 
@@ -175,7 +215,7 @@ int alert_json(char *buf, int buflen) {
 
 /* ── threshold checking ──────────────────────────────────────────────── */
 
-int alert_check(const char *id, double cpu_pct, double rss_mb) {
+int alert_check_sample(const char *id, int has_cpu_pct, double cpu_pct, double rss_mb) {
     int i, transitions = 0;
 
     if (id == NULL) return 0;
@@ -185,6 +225,10 @@ int alert_check(const char *id, double cpu_pct, double rss_mb) {
     for (i = 0; i < ALERT_MAX; i++) {
         if (!g_alerts[i].active) continue;
         if (strcmp(g_alerts[i].container_id, id) != 0) continue;
+
+        if (g_alerts[i].metric == ALERT_CPU && !has_cpu_pct) {
+            continue;
+        }
 
         double value = (g_alerts[i].metric == ALERT_CPU) ? cpu_pct : rss_mb;
         int over     = (value >= g_alerts[i].threshold);
@@ -232,4 +276,8 @@ int alert_check(const char *id, double cpu_pct, double rss_mb) {
 
     pthread_mutex_unlock(&g_lock);
     return transitions;
+}
+
+int alert_check(const char *id, double cpu_pct, double rss_mb) {
+    return alert_check_sample(id, 1, cpu_pct, rss_mb);
 }

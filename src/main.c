@@ -1,8 +1,10 @@
+#include <dirent.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -29,6 +31,54 @@ static void print_banner(void) {
     printf("║  NS|FS|Limits|Sched|Bridge|Caps|Seccomp|EventBus|Orch    ║\n");
     printf("║  Dashboard: run 'web [port]' then open http://localhost   ║\n");
     printf("╚═══════════════════════════════════════════════════════════╝\n\n");
+}
+
+static void reset_runtime_state(void) {
+    static const char *files[] = {
+        "containers.meta",
+        "containers.meta.tmp",
+        "events.log",
+        "metrics.state",
+        "container.log",
+    };
+    DIR *logs_dir;
+
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        if (unlink(files[i]) != 0 && errno != ENOENT) {
+            fprintf(stderr, "[warn] could not remove %s: %s\n",
+                    files[i], strerror(errno));
+        }
+    }
+
+    logs_dir = opendir("logs");
+    if (logs_dir != NULL) {
+        struct dirent *entry;
+        while ((entry = readdir(logs_dir)) != NULL) {
+            char path[512];
+
+            if (strcmp(entry->d_name, ".") == 0 ||
+                strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+
+            if (snprintf(path, sizeof(path), "logs/%s", entry->d_name) >=
+                (int)sizeof(path)) {
+                continue;
+            }
+
+            if (unlink(path) != 0 && errno != ENOENT) {
+                fprintf(stderr, "[warn] could not remove %s: %s\n",
+                        path, strerror(errno));
+            }
+        }
+        closedir(logs_dir);
+    } else if (errno != ENOENT) {
+        fprintf(stderr, "[warn] could not open logs/: %s\n", strerror(errno));
+    }
+
+    if (mkdir("logs", 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "[warn] could not create logs/: %s\n", strerror(errno));
+    }
 }
 
 static int parse_command(char *line, char **args, int max_args) {
@@ -213,6 +263,7 @@ int main(void) {
 
     (void)signal(SIGINT, on_sigint);
 
+    reset_runtime_state();
     eventbus_init();
     metrics_init();
     metrics_load("metrics.state");

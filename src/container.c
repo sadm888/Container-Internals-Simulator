@@ -13,6 +13,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "alert.h"
 #include "bridge.h"
 #include "container.h"
 #include "eventbus.h"
@@ -85,6 +86,63 @@ static void copy_string(char *dst, size_t dst_size, const char *src) {
         return;
     }
     snprintf(dst, dst_size, "%s", src);
+}
+
+static void json_escape_copy(char *dst, size_t dst_size, const char *src) {
+    size_t out = 0;
+
+    if (dst_size == 0) {
+        return;
+    }
+
+    if (src == NULL) {
+        dst[0] = '\0';
+        return;
+    }
+
+    for (size_t i = 0; src[i] != '\0' && out + 1 < dst_size; i++) {
+        unsigned char ch = (unsigned char)src[i];
+
+        if ((ch == '\\' || ch == '"') && out + 2 < dst_size) {
+            dst[out++] = '\\';
+            dst[out++] = (char)ch;
+        } else if (ch == '\n' && out + 2 < dst_size) {
+            dst[out++] = '\\';
+            dst[out++] = 'n';
+        } else if (ch == '\r' && out + 2 < dst_size) {
+            dst[out++] = '\\';
+            dst[out++] = 'r';
+        } else if (ch == '\t' && out + 2 < dst_size) {
+            dst[out++] = '\\';
+            dst[out++] = 't';
+        } else if (ch >= 0x20) {
+            dst[out++] = (char)ch;
+        }
+    }
+
+    dst[out] = '\0';
+}
+
+static unsigned long elapsed_ms_between(const struct timespec *start,
+                                        const struct timespec *end) {
+    time_t sec;
+    long nsec;
+
+    if (start == NULL || end == NULL) {
+        return 0;
+    }
+
+    sec = end->tv_sec - start->tv_sec;
+    nsec = end->tv_nsec - start->tv_nsec;
+    if (nsec < 0) {
+        sec -= 1;
+        nsec += 1000000000L;
+    }
+    if (sec < 0) {
+        return 0;
+    }
+
+    return (unsigned long)sec * 1000UL + (unsigned long)(nsec / 1000000L);
 }
 
 static void trim_newline(char *line) {
@@ -333,6 +391,10 @@ static void poll_states(void) {
     if (changed) {
         save_metadata();
     }
+}
+
+void container_refresh_state(void) {
+    poll_states();
 }
 
 static int normalize_resource_limits(ResourceConfig *limits) {
@@ -1044,8 +1106,7 @@ static int start_container_by_id(const char *id, int schedule_target) {
         unsigned long elapsed_ms;
         int i, cap_drop_count = 0;
         clock_gettime(CLOCK_MONOTONIC, &t_end);
-        elapsed_ms = (unsigned long)(t_end.tv_sec - t_start.tv_sec) * 1000UL
-                   + (unsigned long)(t_end.tv_nsec - t_start.tv_nsec) / 1000000UL;
+        elapsed_ms = elapsed_ms_between(&t_start, &t_end);
         metrics_record_startup_ms(elapsed_ms);
         eventbus_emit(EVENT_CONTAINER_STARTED, container->id,
                       container->command_line, (long)elapsed_ms);
@@ -2473,6 +2534,16 @@ int container_json_all(char *buf, int buflen) {
         char started_buf[32] = "-";
         char exit_buf[16]    = "-";
         char ports_buf[128]  = "";
+        char id_json[CONTAINER_ID_LEN * 2];
+        char name_json[CONTAINER_NAME_LEN * 2];
+        char state_json[16];
+        char ip_json[32];
+        char ports_json[256];
+        char uptime_json[48];
+        char started_json[64];
+        char exit_json[32];
+        char command_json[CONTAINER_COMMAND_LEN * 2];
+        char image_json[IMAGE_REF_LEN * 2];
 
         if (c->started_at > 0) {
             struct tm *tm_s = localtime(&c->started_at);
@@ -2490,6 +2561,17 @@ int container_json_all(char *buf, int buflen) {
             bridge_serialize_port_maps(c->port_maps, c->port_map_count,
                                        ports_buf, sizeof(ports_buf));
 
+        json_escape_copy(id_json, sizeof(id_json), c->id);
+        json_escape_copy(name_json, sizeof(name_json), c->name);
+        json_escape_copy(state_json, sizeof(state_json), state_to_string(c->state));
+        json_escape_copy(ip_json, sizeof(ip_json), c->ip_address[0] ? c->ip_address : "");
+        json_escape_copy(ports_json, sizeof(ports_json), ports_buf);
+        json_escape_copy(uptime_json, sizeof(uptime_json), uptime_buf);
+        json_escape_copy(started_json, sizeof(started_json), started_buf);
+        json_escape_copy(exit_json, sizeof(exit_json), exit_buf);
+        json_escape_copy(command_json, sizeof(command_json), c->command_line);
+        json_escape_copy(image_json, sizeof(image_json), c->image_ref[0] ? c->image_ref : "");
+
         written += snprintf(buf + written, (size_t)(buflen - written),
             "%s{"
             "\"id\":\"%s\","
@@ -2505,17 +2587,17 @@ int container_json_all(char *buf, int buflen) {
             "\"image\":\"%s\""
             "}",
             first ? "" : ",",
-            c->id,
-            c->name,
-            state_to_string(c->state),
+            id_json,
+            name_json,
+            state_json,
             (int)c->pid,
-            c->ip_address[0] ? c->ip_address : "",
-            ports_buf,
-            uptime_buf,
-            started_buf,
-            exit_buf,
-            c->command_line,
-            c->image_ref[0] ? c->image_ref : "");
+            ip_json,
+            ports_json,
+            uptime_json,
+            started_json,
+            exit_json,
+            command_json,
+            image_json);
         first = 0;
     }
 
@@ -2538,6 +2620,8 @@ int container_stats_json_all(char *buf, int buflen) {
     written += snprintf(buf + written, (size_t)(buflen - written), "{");
 
     for (c = head; c != NULL && written < buflen - 128; c = c->next) {
+        char id_json[CONTAINER_ID_LEN * 2];
+
         if (c->state != STATE_RUNNING || c->pid <= 0) continue;
 
         unsigned long rss_kb = 0;
@@ -2555,10 +2639,14 @@ int container_stats_json_all(char *buf, int buflen) {
             fclose(f);
         }
 
+        metrics_update_mem_highwater(rss_kb / 1024);
+        alert_check_sample(c->id, 0, 0.0, rss_kb / 1024.0);
+        json_escape_copy(id_json, sizeof(id_json), c->id);
+
         written += snprintf(buf + written, (size_t)(buflen - written),
             "%s\"%s\":{\"rss_mb\":%lu}",
             first ? "" : ",",
-            c->id,
+            id_json,
             rss_kb / 1024);
         first = 0;
     }

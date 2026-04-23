@@ -243,7 +243,7 @@ function renderContainers(containers) {
 function renderImages(containers) {
   const seen = new Map();
   containers.forEach(c => {
-    const img = c.image || "—";
+    const img = c.image || "rootfs";
     if (!seen.has(img)) seen.set(img, { count: 0, running: 0 });
     seen.get(img).count++;
     if (c.state === "RUNNING") seen.get(img).running++;

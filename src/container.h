@@ -97,6 +97,7 @@ int container_get_info(const char *id, ContainerState *state,
 int container_exec_quiet(const char *id, const char *command_line);
 
 /* Web API helpers. */
+void container_refresh_state(void);
 int container_json_all(char *buf, int buflen);
 int container_stats_json_all(char *buf, int buflen);
 int container_send_signal(const char *id, int sig);

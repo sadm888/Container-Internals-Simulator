@@ -11,6 +11,29 @@
 static Metrics          g_metrics;
 static pthread_mutex_t  g_lock = PTHREAD_MUTEX_INITIALIZER;
 
+#define MAX_REASONABLE_STARTUP_MS (10UL * 60UL * 1000UL)
+
+static void normalize_startup_metrics_locked(void) {
+    if (g_metrics.startup_count == 0) {
+        g_metrics.startup_total_ms = 0;
+        g_metrics.startup_max_ms = 0;
+        g_metrics.startup_min_ms = ULONG_MAX;
+        memset(g_metrics.startup_buckets, 0, sizeof(g_metrics.startup_buckets));
+        return;
+    }
+
+    if (g_metrics.startup_min_ms == ULONG_MAX ||
+        g_metrics.startup_min_ms > g_metrics.startup_max_ms ||
+        g_metrics.startup_total_ms < g_metrics.startup_max_ms ||
+        (g_metrics.startup_total_ms / g_metrics.startup_count) > MAX_REASONABLE_STARTUP_MS) {
+        g_metrics.startup_count = 0;
+        g_metrics.startup_total_ms = 0;
+        g_metrics.startup_max_ms = 0;
+        g_metrics.startup_min_ms = ULONG_MAX;
+        memset(g_metrics.startup_buckets, 0, sizeof(g_metrics.startup_buckets));
+    }
+}
+
 void metrics_init(void) {
     pthread_mutex_lock(&g_lock);
     g_metrics = (Metrics){0};
@@ -45,6 +68,10 @@ void metrics_record_startup_ms(unsigned long ms) {
     unsigned long bucket;
 
     pthread_mutex_lock(&g_lock);
+    if (ms > MAX_REASONABLE_STARTUP_MS) {
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
     g_metrics.startup_count++;
     g_metrics.startup_total_ms += ms;
 
@@ -294,6 +321,7 @@ void metrics_load(const char *path) {
         TRY("mem_highwater_mb",     mem_highwater_mb)
 #undef TRY
     }
+    normalize_startup_metrics_locked();
     pthread_mutex_unlock(&g_lock);
     fclose(f);
 }

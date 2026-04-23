@@ -17,6 +17,37 @@ static unsigned        g_total = 0;
 static pthread_mutex_t g_lock  = PTHREAD_MUTEX_INITIALIZER;
 static FILE           *g_logfile = NULL;   /* append-only persistence */
 
+static void json_escape_copy(char *dst, size_t dst_size, const char *src) {
+    size_t out = 0;
+
+    if (dst_size == 0) return;
+    if (src == NULL) {
+        dst[0] = '\0';
+        return;
+    }
+
+    for (size_t i = 0; src[i] != '\0' && out + 1 < dst_size; i++) {
+        unsigned char ch = (unsigned char)src[i];
+        if ((ch == '\\' || ch == '"') && out + 2 < dst_size) {
+            dst[out++] = '\\';
+            dst[out++] = (char)ch;
+        } else if (ch == '\n' && out + 2 < dst_size) {
+            dst[out++] = '\\';
+            dst[out++] = 'n';
+        } else if (ch == '\r' && out + 2 < dst_size) {
+            dst[out++] = '\\';
+            dst[out++] = 'r';
+        } else if (ch == '\t' && out + 2 < dst_size) {
+            dst[out++] = '\\';
+            dst[out++] = 't';
+        } else if (ch >= 0x20) {
+            dst[out++] = (char)ch;
+        }
+    }
+
+    dst[out] = '\0';
+}
+
 /* ── type → name table ───────────────────────────────────────────────── */
 
 static const char *g_type_names[EVENT_TYPE_COUNT] = {
@@ -309,8 +340,16 @@ int eventbus_json_recent(int n, char *buf, int buflen) {
     for (i = start; i < total && written < buflen - 256; i++) {
         const Event *e = &g_ring[i & EVENTBUS_RING_MASK];
         char tbuf[22] = "-";
+        char type_json[40];
+        char ts_json[32];
+        char id_json[sizeof(e->container_id) * 2];
+        char detail_json[sizeof(e->detail) * 2];
         struct tm *tm_info = localtime(&e->timestamp);
         if (tm_info) strftime(tbuf, sizeof(tbuf), "%Y-%m-%dT%H:%M:%S", tm_info);
+        json_escape_copy(type_json, sizeof(type_json), eventbus_type_name(e->type));
+        json_escape_copy(ts_json, sizeof(ts_json), tbuf);
+        json_escape_copy(id_json, sizeof(id_json), e->container_id);
+        json_escape_copy(detail_json, sizeof(detail_json), e->detail);
 
         written += snprintf(buf + written, (size_t)(buflen - written),
             "%s{"
@@ -323,10 +362,10 @@ int eventbus_json_recent(int n, char *buf, int buflen) {
             "}",
             first ? "" : ",",
             e->seq,
-            eventbus_type_name(e->type),
-            tbuf,
-            e->container_id,
-            e->detail,
+            type_json,
+            ts_json,
+            id_json,
+            detail_json,
             e->value);
         first = 0;
     }
