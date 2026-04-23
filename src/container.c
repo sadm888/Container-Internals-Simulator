@@ -152,6 +152,44 @@ static void trim_newline(char *line) {
     line[strcspn(line, "\r\n")] = '\0';
 }
 
+static int split_command_argv(char *buffer, char **argv, int max_args) {
+    char *p = buffer;
+    int argc = 0;
+
+    if (buffer == NULL || argv == NULL || max_args < 2) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        if (argc >= max_args - 1) {
+            errno = E2BIG;
+            return -1;
+        }
+
+        if (*p == '"' || *p == '\'') {
+            char quote = *p++;
+            argv[argc++] = p;
+            while (*p && *p != quote) p++;
+            if (*p == quote) *p++ = '\0';
+        } else {
+            argv[argc++] = p;
+            while (*p && *p != ' ' && *p != '\t') p++;
+            if (*p) *p++ = '\0';
+        }
+    }
+
+    if (argc == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    argv[argc] = NULL;
+    return argc;
+}
+
 static void append_container(Container *container) {
     container->next = NULL;
     if (tail == NULL) {
@@ -600,10 +638,51 @@ static void box_row(const char *label, const char *value) {
     printf("\xe2\x94\x82  %-10s  %-46.46s\xe2\x94\x82\n", label, value);
 }
 
+static void ensure_container_log_path(Container *container) {
+    if (container == NULL || container->log_path[0] != '\0') {
+        return;
+    }
+
+    (void)mkdir("logs", 0755);
+    snprintf(container->log_path, sizeof(container->log_path),
+             "logs/%s.log", container->id);
+}
+
+static void describe_container_network(const Container *container,
+                                       char *buffer, size_t buffer_size) {
+    if (buffer == NULL || buffer_size == 0) {
+        return;
+    }
+
+    if (container != NULL && container->ip_address[0] != '\0') {
+        snprintf(buffer, buffer_size, "%s + bridge %s",
+                 network_profile(), BRIDGE_NAME);
+        return;
+    }
+
+    if (container != NULL && container->network_error[0] != '\0') {
+        snprintf(buffer, buffer_size, "%s (%s)",
+                 network_profile(), container->network_error);
+        return;
+    }
+
+    if (bridge_is_up()) {
+        snprintf(buffer, buffer_size,
+                 "%s (bridge attach unavailable; run with network admin privileges)",
+                 network_profile());
+        return;
+    }
+
+    snprintf(buffer, buffer_size,
+             "%s (bridge down; run 'net init' as root)",
+             network_profile());
+}
+
 static void print_container_banner(const Container *container, pid_t namespace_pid) {
     char pid_text[24];
     char nspid_text[24];
     char limits_text[128];
+    char net_text[160];
 
     if (container->pid > 0)
         snprintf(pid_text, sizeof(pid_text), "%d", (int)container->pid);
@@ -616,6 +695,7 @@ static void print_container_banner(const Container *container, pid_t namespace_p
         nspid_text[0] = '\0';
 
     resource_format_limits(&container->resource_limits, limits_text, sizeof(limits_text));
+    describe_container_network(container, net_text, sizeof(net_text));
 
     const char *state = state_to_string(container->state);
 
@@ -648,7 +728,7 @@ static void print_container_banner(const Container *container, pid_t namespace_p
     box_row("limits",   limits_text);
     box_row("isolate",  namespace_profile());
     box_row("fs",       filesystem_profile());
-    box_row("net",      network_profile());
+    box_row("net",      net_text);
     box_row("res",      resource_profile());
 
     if (container->ip_address[0] != '\0') {
@@ -675,6 +755,9 @@ static void print_start_error(const Container *container, int error_number) {
     namespace_format_start_error(error_number, message, sizeof(message));
     printf("[error] failed to start %s with isolation setup\n", container->id);
     printf("[hint] rootfs: %s\n", container->rootfs);
+    if (container->network_error[0] != '\0') {
+        printf("[hint] networking: %s\n", container->network_error);
+    }
     printf("[hint] %s\n\n", message);
 }
 
@@ -848,6 +931,7 @@ int container_create(const ContainerSpec *spec, char *out_id, size_t out_id_size
     memset(&container->resource_limits, 0, sizeof(container->resource_limits));
     container->ip_address[0] = '\0';
     container->veth_host[0]  = '\0';
+    container->network_error[0] = '\0';
     container->port_map_count = 0;
     container->security = security_config_default();
     if (spec != NULL) {
@@ -948,19 +1032,45 @@ static int container_net_setup(pid_t container_pid, NetConfig *cfg, void *userda
     Container *c = (Container *)userdata;
     char host_veth[16], peer_veth[16];
     char ip[16];
+    int strict_ports = 0;
 
-    if (!bridge_is_up()) return 0;
+    if (c == NULL || cfg == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    strict_ports = c->port_map_count > 0;
+
+    if (!bridge_is_up()) {
+        if (strict_ports) {
+            snprintf(c->network_error, sizeof(c->network_error),
+                     "published ports require bridge networking; run 'net init' as root first");
+            errno = ENETDOWN;
+            return -1;
+        }
+        snprintf(c->network_error, sizeof(c->network_error),
+                 "bridge %s is down; using loopback-only mode", BRIDGE_NAME);
+        return 0;
+    }
+
+    if (bridge_preflight(1, strict_ports) != 0) {
+        copy_string(c->network_error, sizeof(c->network_error), bridge_last_error());
+        log_event("%s network preflight failed: %s", c->id, c->network_error);
+        return strict_ports ? -1 : 0;
+    }
 
     if (bridge_alloc_ip(ip, sizeof(ip)) != 0) {
-        log_event("%s bridge IP allocation failed", c->id);
-        return 0; /* non-fatal: start without bridge */
+        copy_string(c->network_error, sizeof(c->network_error), bridge_last_error());
+        log_event("%s bridge IP allocation failed: %s", c->id, c->network_error);
+        return strict_ports ? -1 : 0;
     }
 
     if (bridge_setup_veth(c->id, container_pid, ip,
                           host_veth, sizeof(host_veth),
                           peer_veth, sizeof(peer_veth)) != 0) {
-        log_event("%s veth setup failed", c->id);
-        return 0; /* non-fatal */
+        copy_string(c->network_error, sizeof(c->network_error), bridge_last_error());
+        log_event("%s veth setup failed: %s", c->id, c->network_error);
+        return strict_ports ? -1 : 0;
     }
 
     snprintf(cfg->peer_veth, sizeof(cfg->peer_veth), "%s", peer_veth);
@@ -969,10 +1079,11 @@ static int container_net_setup(pid_t container_pid, NetConfig *cfg, void *userda
 
     snprintf(c->ip_address, sizeof(c->ip_address), "%s", ip);
     snprintf(c->veth_host,  sizeof(c->veth_host),  "%s", host_veth);
+    c->network_error[0] = '\0';
     return 0;
 }
 
-static int start_container_by_id(const char *id, int schedule_target) {
+static int start_container_by_id(const char *id, int schedule_target, int capture_logs) {
     Container *container = NULL;
     NamespaceConfig namespace_config;
     NamespaceStartResult start_result;
@@ -1013,7 +1124,11 @@ static int start_container_by_id(const char *id, int schedule_target) {
     namespace_config.net_setup       = container_net_setup;
     namespace_config.net_setup_data  = container;
 
-    if (container->log_path[0] != '\0') {
+    if (capture_logs) {
+        ensure_container_log_path(container);
+    }
+
+    if (capture_logs && container->log_path[0] != '\0') {
         namespace_config.log_fd = open(container->log_path,
                                        O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (namespace_config.log_fd < 0) {
@@ -1025,6 +1140,7 @@ static int start_container_by_id(const char *id, int schedule_target) {
     /* Reset networking fields — will be filled by net_setup callback if bridge is up */
     container->ip_address[0] = '\0';
     container->veth_host[0]  = '\0';
+    container->network_error[0] = '\0';
 
     clock_gettime(CLOCK_MONOTONIC, &t_start);
     if (namespace_start_container(&namespace_config,
@@ -1061,7 +1177,15 @@ static int start_container_by_id(const char *id, int schedule_target) {
     if (container->ip_address[0] != '\0') {
         int i;
         for (i = 0; i < container->port_map_count; i++) {
-            bridge_add_port_forward(&container->port_maps[i], container->ip_address);
+            if (bridge_add_port_forward(&container->port_maps[i], container->ip_address) != 0) {
+                copy_string(container->network_error, sizeof(container->network_error),
+                            bridge_last_error());
+                log_event("%s port forward failed: %s", container->id, container->network_error);
+                printf("[error] failed to publish ports for %s\n", container->id);
+                printf("[hint] networking: %s\n\n", container->network_error);
+                stop_container_process(container, 1, 0);
+                return -1;
+            }
         }
     }
 
@@ -1132,7 +1256,7 @@ int container_run(const ContainerSpec *spec, char *out_id, size_t out_id_size) {
         return -1;
     }
 
-    if (start_container_by_id(container_id, 0) != 0) {
+    if (start_container_by_id(container_id, 0, 0) != 0) {
         return -1;
     }
 
@@ -1159,13 +1283,11 @@ int container_run_background(const ContainerSpec *spec, char *out_id, size_t out
 
     container = find_container(container_id);
     if (container != NULL) {
-        mkdir("logs", 0755);
-        snprintf(container->log_path, sizeof(container->log_path),
-                 "logs/%s.log", container_id);
+        ensure_container_log_path(container);
         save_metadata();
     }
 
-    if (start_container_by_id(container_id, 1) != 0) {
+    if (start_container_by_id(container_id, 1, 1) != 0) {
         return -1;
     }
 
@@ -1177,7 +1299,7 @@ int container_run_background(const ContainerSpec *spec, char *out_id, size_t out
 }
 
 int container_start(const char *id) {
-    return start_container_by_id(id, 1);
+    return start_container_by_id(id, 1, 1);
 }
 
 int container_stop(const char *id, int timeout_s) {
@@ -1819,6 +1941,7 @@ int container_inspect(const char *id) {
         char stopped_buf[32] = "-";
         char uptime_buf[24]  = "-";
         char exit_buf[16];
+        char network_warning[160];
         time_t now = time(NULL);
 
         if (container->started_at > 0) {
@@ -1897,7 +2020,9 @@ int container_inspect(const char *id) {
         } else {
             printf("}");
         }
-        printf("\n  }");
+        describe_container_network(container, network_warning, sizeof(network_warning));
+        printf(",\n    \"Note\"      : \"%s\"\n", network_warning);
+        printf("  }");
 
         if ((container->state == STATE_RUNNING || container->state == STATE_PAUSED) &&
             container->pid > 0) {
@@ -1920,7 +2045,6 @@ int container_exec(const char *id, const char *command_line) {
     Container *container = NULL;
     char cmd_buf[256];
     char *argv[32];
-    char *token;
     int argc = 0;
     /* uts, net, mnt — entered in this order; mnt is best-effort */
     const char *ns_names[] = {"uts", "net", "mnt"};
@@ -1954,16 +2078,11 @@ int container_exec(const char *id, const char *command_line) {
         return -1;
     }
 
-    token = strtok(cmd_buf, " ");
-    while (token != NULL && argc < (int)(sizeof(argv) / sizeof(argv[0])) - 1) {
-        argv[argc++] = token;
-        token = strtok(NULL, " ");
-    }
-    if (argc == 0) {
+    argc = split_command_argv(cmd_buf, argv, (int)(sizeof(argv) / sizeof(argv[0])));
+    if (argc < 0) {
         printf("[error] empty command\n\n");
         return -1;
     }
-    argv[argc] = NULL;
 
     for (i = 0; i < 3; i++) {
         snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/%s",
@@ -2049,7 +2168,6 @@ int container_exec_quiet(const char *id, const char *command_line) {
     Container *container = NULL;
     char cmd_buf[256];
     char *argv[32];
-    char *token;
     int argc = 0;
     const char *ns_names[] = {"uts", "net", "mnt"};
     int ns_types[]          = {CLONE_NEWUTS, CLONE_NEWNET, CLONE_NEWNS};
@@ -2066,13 +2184,8 @@ int container_exec_quiet(const char *id, const char *command_line) {
     if (snprintf(cmd_buf, sizeof(cmd_buf), "%s", command_line) >= (int)sizeof(cmd_buf))
         return -1;
 
-    token = strtok(cmd_buf, " ");
-    while (token && argc < (int)(sizeof(argv)/sizeof(argv[0])) - 1) {
-        argv[argc++] = token;
-        token = strtok(NULL, " ");
-    }
-    if (argc == 0) return -1;
-    argv[argc] = NULL;
+    argc = split_command_argv(cmd_buf, argv, (int)(sizeof(argv) / sizeof(argv[0])));
+    if (argc < 0) return -1;
 
     for (i = 0; i < 3; i++) {
         snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/%s",
@@ -2398,6 +2511,9 @@ int container_net_summary(void) {
 
     if (!any_networked) {
         printf("  (no containers with bridge networking)\n");
+        if (bridge_is_up()) {
+            printf("  note: containers may be running loopback-only because bridge attach needs root/CAP_NET_ADMIN\n");
+        }
     }
     printf("\n");
     return 0;
@@ -2405,6 +2521,7 @@ int container_net_summary(void) {
 
 int container_net(const char *id) {
     Container *container = NULL;
+    char network_note[160];
 
     if (id == NULL || id[0] == '\0') {
         printf("[error] usage: net <id>\n\n");
@@ -2422,6 +2539,8 @@ int container_net(const char *id) {
     printf("  container : %s\n", container->id);
     printf("  state     : %s\n", state_to_string(container->state));
     printf("  profile   : %s\n", network_profile());
+    describe_container_network(container, network_note, sizeof(network_note));
+    printf("  note      : %s\n", network_note);
 
     if (container->state == STATE_RUNNING && container->pid > 0) {
         char netns_path[128];

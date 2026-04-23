@@ -14,6 +14,7 @@ metrics.state
 logs/
 rootfs/
 myrootfs/
+base/
 /tmp/container-sim/
 
 # editor

@@ -446,12 +446,19 @@ static void *monitor_thread(void *arg) {
         for (int w = 0; w < wn; w++) {
             WorkItem *wi = &work[w];
 
+            pthread_mutex_lock(&g_lock);
+            if (!g_running) {
+                pthread_mutex_unlock(&g_lock);
+                break;
+            }
+            pthread_mutex_unlock(&g_lock);
+
             if (wi->type == 0) {
                 /* health check */
                 int hc = container_exec_quiet(wi->cid, wi->hcmd);
                 pthread_mutex_lock(&g_lock);
                 Service *svc = &g_spec.services[wi->idx];
-                if (strcmp(svc->container_id, wi->cid) != 0) {
+                if (!g_running || strcmp(svc->container_id, wi->cid) != 0) {
                     pthread_mutex_unlock(&g_lock);
                     continue;
                 }
@@ -475,6 +482,13 @@ static void *monitor_thread(void *arg) {
                 /* restart with exponential backoff */
                 sleep((unsigned)wi->backoff_s);
 
+                pthread_mutex_lock(&g_lock);
+                if (!g_running) {
+                    pthread_mutex_unlock(&g_lock);
+                    continue;
+                }
+                pthread_mutex_unlock(&g_lock);
+
                 container_delete(wi->cid);
 
                 char resolved[512];
@@ -496,6 +510,14 @@ static void *monitor_thread(void *arg) {
 
                 pthread_mutex_lock(&g_lock);
                 Service *svc = &g_spec.services[wi->idx];
+                if (!g_running) {
+                    pthread_mutex_unlock(&g_lock);
+                    if (started) {
+                        container_stop(new_id, 1);
+                        container_delete(new_id);
+                    }
+                    continue;
+                }
                 if (started) {
                     snprintf(svc->container_id, sizeof(svc->container_id), "%s", new_id);
                     svc->state             = SVC_RUNNING;
@@ -632,6 +654,7 @@ void orch_down(void) {
             container_stop(svc->container_id, 5);
             container_delete(svc->container_id);
             svc->state = SVC_STOPPED;
+            svc->container_id[0] = '\0';
         }
     }
 

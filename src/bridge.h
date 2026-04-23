@@ -18,10 +18,23 @@ typedef struct {
 
 #define MAX_PORT_MAPS 8
 
+typedef struct {
+    int is_root;
+    int ip_cmd;
+    int iptables_cmd;
+    int bridge_up;
+    int ip_forward;
+} BridgeDoctor;
+
 /* Bridge lifecycle */
 int  bridge_init(void);
 int  bridge_teardown(void);
 int  bridge_is_up(void);
+int  bridge_preflight(int require_bridge_up, int require_iptables);
+void bridge_collect_doctor(BridgeDoctor *doctor);
+void bridge_print_doctor(void);
+void bridge_clear_last_error(void);
+const char *bridge_last_error(void);
 
 /* IP pool */
 int  bridge_alloc_ip(char *buf, size_t buf_size);

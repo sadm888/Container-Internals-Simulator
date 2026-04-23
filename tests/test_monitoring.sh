@@ -83,6 +83,27 @@ fi
 
 echo ""
 
+# ─── logs: create + start also captures stdout ────────────────────────────────
+echo "--- logs: start captures stdout ---"
+rm -f containers.meta containers.meta.tmp
+out=$( (
+    printf 'create start-log host-start-log %s\n' "$ROOTFS"
+    printf 'start container-0001\n'
+    sleep 1.0
+    printf 'logs container-0001\n'
+    printf 'delete container-0001\n'
+    printf 'exit\n'
+) | "$BIN" 2>&1)
+
+echo "$out" | grep -q "host-start-log" \
+    && pass "logs shows stdout for create + start containers" \
+    || {
+        fail "create + start containers did not capture logs"
+        echo "$out" | tail -20
+    }
+
+echo ""
+
 # ─── exec: command runs in container namespace ───────────────────────────────
 # Must use a single session: exec requires the container to still be RUNNING,
 # but exit triggers cleanup_all_containers which stops background containers.

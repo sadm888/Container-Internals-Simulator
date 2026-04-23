@@ -67,11 +67,12 @@ static int build_exec_argv(const char *command_line,
         if (!*p) break;
         if (argc >= max_args - 1) { errno = E2BIG; return -1; }
 
-        if (*p == '"') {
+        if (*p == '"' || *p == '\'') {
+            char quote = *p;
             p++;                          /* skip opening quote */
             argv[argc++] = p;
-            while (*p && *p != '"') p++;
-            if (*p == '"') *p++ = '\0';   /* strip closing quote */
+            while (*p && *p != quote) p++;
+            if (*p == quote) *p++ = '\0';   /* strip closing quote */
         } else {
             argv[argc++] = p;
             while (*p && *p != ' ') p++;
@@ -360,8 +361,7 @@ int namespace_start_container(const NamespaceConfig *config,
     tok.ok = '1';
     if (config->net_setup != NULL) {
         if (config->net_setup(pid, &tok.net, config->net_setup_data) != 0) {
-            /* veth setup failed: still start container, just no eth0 */
-            memset(&tok.net, 0, sizeof(tok.net));
+            goto fail_kill;
         }
     }
 

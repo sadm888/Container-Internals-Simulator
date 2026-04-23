@@ -47,6 +47,7 @@ typedef struct Container {
     ResourceConfig    resource_limits;
     char              ip_address[16];           /* "" or "172.17.0.N" if bridge active */
     char              veth_host[16];            /* "" or "vethXXXX" host-side interface */
+    char              network_error[256];       /* startup networking diagnosis, not persisted */
     PortMapping       port_maps[MAX_PORT_MAPS];
     int               port_map_count;
     SecurityConfig    security;

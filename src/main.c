@@ -33,47 +33,18 @@ static void print_banner(void) {
     printf("╚═══════════════════════════════════════════════════════════╝\n\n");
 }
 
-static void reset_runtime_state(void) {
-    static const char *files[] = {
-        "containers.meta",
-        "containers.meta.tmp",
+static void initialize_runtime_state(void) {
+    static const char *session_files[] = {
         "events.log",
         "metrics.state",
         "container.log",
     };
-    DIR *logs_dir;
 
-    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
-        if (unlink(files[i]) != 0 && errno != ENOENT) {
+    for (size_t i = 0; i < sizeof(session_files) / sizeof(session_files[0]); i++) {
+        if (unlink(session_files[i]) != 0 && errno != ENOENT) {
             fprintf(stderr, "[warn] could not remove %s: %s\n",
-                    files[i], strerror(errno));
+                    session_files[i], strerror(errno));
         }
-    }
-
-    logs_dir = opendir("logs");
-    if (logs_dir != NULL) {
-        struct dirent *entry;
-        while ((entry = readdir(logs_dir)) != NULL) {
-            char path[512];
-
-            if (strcmp(entry->d_name, ".") == 0 ||
-                strcmp(entry->d_name, "..") == 0) {
-                continue;
-            }
-
-            if (snprintf(path, sizeof(path), "logs/%s", entry->d_name) >=
-                (int)sizeof(path)) {
-                continue;
-            }
-
-            if (unlink(path) != 0 && errno != ENOENT) {
-                fprintf(stderr, "[warn] could not remove %s: %s\n",
-                        path, strerror(errno));
-            }
-        }
-        closedir(logs_dir);
-    } else if (errno != ENOENT) {
-        fprintf(stderr, "[warn] could not open logs/: %s\n", strerror(errno));
     }
 
     if (mkdir("logs", 0755) != 0 && errno != EEXIST) {
@@ -89,11 +60,12 @@ static int parse_command(char *line, char **args, int max_args) {
         while (*p == ' ' || *p == '\t') p++;
         if (!*p) break;
 
-        if (*p == '"') {
+        if (*p == '"' || *p == '\'') {
+            char quote = *p;
             p++;                    /* skip opening quote */
             args[count++] = p;
-            while (*p && *p != '"') p++;
-            if (*p == '"') *p++ = '\0';   /* strip closing quote */
+            while (*p && *p != quote) p++;
+            if (*p == quote) *p++ = '\0';   /* strip closing quote */
         } else {
             args[count++] = p;
             while (*p && *p != ' ' && *p != '\t') p++;
@@ -134,6 +106,7 @@ static void print_help(void) {
     printf("  logs [-f] [-n N] <id>  (-f follows in real-time; -n shows last N lines)\n");
     printf("  net                    (show bridge status + all networked containers)\n");
     printf("  net ls                 (alias for net)\n");
+    printf("  net doctor             (show host networking prerequisites and bridge state)\n");
     printf("  net init               (create bridge csbr0 — requires root)\n");
     printf("  net teardown           (remove bridge)\n");
     printf("  net <id>               (show per-container network detail)\n");
@@ -183,7 +156,7 @@ static int parse_limit_flags(char **args, int argc, int *index,
     while (*index < argc) {
         const char *flag = args[*index];
 
-        if (flag == NULL || strncmp(flag, "--", 2) != 0) {
+        if (flag == NULL || flag[0] != '-') {
             break;
         }
 
@@ -263,7 +236,7 @@ int main(void) {
 
     (void)signal(SIGINT, on_sigint);
 
-    reset_runtime_state();
+    initialize_runtime_state();
     eventbus_init();
     metrics_init();
     metrics_load("metrics.state");
@@ -558,19 +531,23 @@ int main(void) {
             if (argc == 1 ||
                 (argc == 2 && strcmp(args[1], "ls") == 0)) {
                 container_net_summary();
+            } else if (argc == 2 && strcmp(args[1], "doctor") == 0) {
+                bridge_print_doctor();
             } else if (strcmp(args[1], "init") == 0) {
                 if (bridge_init() == 0) {
                     printf("[network] bridge %s up — subnet 172.17.0.0/16\n\n", BRIDGE_NAME);
                     eventbus_emit(EVENT_NET_INIT, NULL, BRIDGE_NAME, 0);
                 } else {
-                    printf("[error] bridge init failed (are you root?)\n\n");
+                    printf("[error] bridge init failed\n");
+                    printf("[hint] %s\n\n", bridge_last_error());
                 }
             } else if (strcmp(args[1], "teardown") == 0) {
                 if (bridge_teardown() == 0) {
                     printf("[network] bridge %s removed\n\n", BRIDGE_NAME);
                     eventbus_emit(EVENT_NET_TEARDOWN, NULL, BRIDGE_NAME, 0);
                 } else {
-                    printf("[error] bridge teardown failed\n\n");
+                    printf("[error] bridge teardown failed\n");
+                    printf("[hint] %s\n\n", bridge_last_error());
                 }
             } else {
                 container_net(args[1]);
