@@ -2451,6 +2451,95 @@ int container_logs_follow(const char *id) {
     return 0;
 }
 
+int container_logs_json_tail(const char *id, int n, char *buf, int buflen) {
+    Container *container = NULL;
+    FILE *f = NULL;
+    char **ring = NULL;
+    char line[1024];
+    int head_idx = 0;
+    int count = 0;
+    int written = 0;
+
+    if (buf == NULL || buflen <= 2 || id == NULL || id[0] == '\0' || n <= 0) {
+        return -1;
+    }
+
+    poll_states();
+    container = find_container(id);
+    if (container == NULL) {
+        return snprintf(buf, (size_t)buflen,
+                        "{\"id\":\"%s\",\"found\":false,\"log_path\":\"\",\"lines\":[]}",
+                        id);
+    }
+
+    written = snprintf(buf, (size_t)buflen,
+                       "{\"id\":\"%s\",\"found\":true,\"log_path\":\"%s\",\"lines\":[",
+                       container->id, container->log_path);
+    if (written < 0 || written >= buflen) {
+        return -1;
+    }
+
+    if (container->log_path[0] == '\0') {
+        written += snprintf(buf + written, (size_t)(buflen - written), "]}");
+        return written < buflen ? written : -1;
+    }
+
+    f = fopen(container->log_path, "r");
+    if (f == NULL) {
+        written += snprintf(buf + written, (size_t)(buflen - written), "]}");
+        return written < buflen ? written : -1;
+    }
+
+    ring = calloc((size_t)n, sizeof(char *));
+    if (ring == NULL) {
+        fclose(f);
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), f) != NULL) {
+        free(ring[head_idx]);
+        ring[head_idx] = strdup(line);
+        if (ring[head_idx] != NULL) {
+            trim_newline(ring[head_idx]);
+        }
+        head_idx = (head_idx + 1) % n;
+        if (count < n) count++;
+    }
+    fclose(f);
+
+    {
+        int start = (count < n) ? 0 : head_idx;
+        int first = 1;
+
+        for (int i = 0; i < count; i++) {
+            int idx = (start + i) % n;
+            char line_json[2048];
+
+            if (ring[idx] == NULL) continue;
+            json_escape_copy(line_json, sizeof(line_json), ring[idx]);
+            written += snprintf(buf + written, (size_t)(buflen - written),
+                                "%s\"%s\"",
+                                first ? "" : ",",
+                                line_json);
+            if (written < 0 || written >= buflen) {
+                written = -1;
+                break;
+            }
+            first = 0;
+        }
+    }
+
+    for (int i = 0; i < n; i++) free(ring[i]);
+    free(ring);
+
+    if (written < 0) {
+        return -1;
+    }
+
+    written += snprintf(buf + written, (size_t)(buflen - written), "]}");
+    return written < buflen ? written : -1;
+}
+
 int container_security_show(const char *id) {
     Container *container = NULL;
 
@@ -2653,8 +2742,10 @@ int container_json_all(char *buf, int buflen) {
         char started_buf[32] = "-";
         char exit_buf[16]    = "-";
         char ports_buf[128]  = "";
+        char net_note[160]   = "";
         char id_json[CONTAINER_ID_LEN * 2];
         char name_json[CONTAINER_NAME_LEN * 2];
+        char host_json[CONTAINER_HOSTNAME_LEN * 2];
         char state_json[16];
         char ip_json[32];
         char ports_json[256];
@@ -2663,6 +2754,9 @@ int container_json_all(char *buf, int buflen) {
         char exit_json[32];
         char command_json[CONTAINER_COMMAND_LEN * 2];
         char image_json[IMAGE_REF_LEN * 2];
+        char rootfs_json[CONTAINER_ROOTFS_LEN * 2];
+        char log_json[CONTAINER_LOG_PATH_LEN * 2];
+        char net_note_json[320];
 
         if (c->started_at > 0) {
             struct tm *tm_s = localtime(&c->started_at);
@@ -2680,8 +2774,11 @@ int container_json_all(char *buf, int buflen) {
             bridge_serialize_port_maps(c->port_maps, c->port_map_count,
                                        ports_buf, sizeof(ports_buf));
 
+        describe_container_network(c, net_note, sizeof(net_note));
+
         json_escape_copy(id_json, sizeof(id_json), c->id);
         json_escape_copy(name_json, sizeof(name_json), c->name);
+        json_escape_copy(host_json, sizeof(host_json), c->hostname);
         json_escape_copy(state_json, sizeof(state_json), state_to_string(c->state));
         json_escape_copy(ip_json, sizeof(ip_json), c->ip_address[0] ? c->ip_address : "");
         json_escape_copy(ports_json, sizeof(ports_json), ports_buf);
@@ -2690,11 +2787,15 @@ int container_json_all(char *buf, int buflen) {
         json_escape_copy(exit_json, sizeof(exit_json), exit_buf);
         json_escape_copy(command_json, sizeof(command_json), c->command_line);
         json_escape_copy(image_json, sizeof(image_json), c->image_ref[0] ? c->image_ref : "");
+        json_escape_copy(rootfs_json, sizeof(rootfs_json), c->rootfs);
+        json_escape_copy(log_json, sizeof(log_json), c->log_path);
+        json_escape_copy(net_note_json, sizeof(net_note_json), net_note);
 
         written += snprintf(buf + written, (size_t)(buflen - written),
             "%s{"
             "\"id\":\"%s\","
             "\"name\":\"%s\","
+            "\"hostname\":\"%s\","
             "\"state\":\"%s\","
             "\"pid\":%d,"
             "\"ip\":\"%s\","
@@ -2703,11 +2804,15 @@ int container_json_all(char *buf, int buflen) {
             "\"started_at\":\"%s\","
             "\"exit_code\":\"%s\","
             "\"command\":\"%s\","
-            "\"image\":\"%s\""
+            "\"image\":\"%s\","
+            "\"rootfs\":\"%s\","
+            "\"log_path\":\"%s\","
+            "\"network_note\":\"%s\""
             "}",
             first ? "" : ",",
             id_json,
             name_json,
+            host_json,
             state_json,
             (int)c->pid,
             ip_json,
@@ -2716,7 +2821,10 @@ int container_json_all(char *buf, int buflen) {
             started_json,
             exit_json,
             command_json,
-            image_json);
+            image_json,
+            rootfs_json,
+            log_json,
+            net_note_json);
         first = 0;
     }
 

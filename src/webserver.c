@@ -20,6 +20,7 @@
 #define BUF_EVENTS   32768   /* 32 KB — enough for 100 events */
 #define BUF_METRICS   4096
 #define BUF_CONTAINERS (256 * 1024)  /* 256 KB — up to ~700 containers */
+#define BUF_LOGS     16384
 
 static int           g_server_fd = -1;
 static pthread_t     g_server_thread;
@@ -193,6 +194,28 @@ static void handle_connection(int fd) {
             if (len < 0) { snprintf(buf, BUF_EVENTS, "[]"); len = 2; }
             resp_ok_json(fd, buf, len);
             free(buf);
+
+        } else if (strncmp(path, "/api/containers/", 16) == 0 &&
+                   strstr(path + 16, "/logs") != NULL) {
+            char cid[64] = {0};
+            int want = qs_int(qs, "n", 40);
+            char buf[BUF_LOGS];
+            int len;
+
+            if (sscanf(path, "/api/containers/%63[^/]/logs", cid) != 1) {
+                resp_not_found(fd);
+                return;
+            }
+
+            if (want <= 0) want = 40;
+            if (want > 200) want = 200;
+
+            len = container_logs_json_tail(cid, want, buf, sizeof(buf));
+            if (len < 0) {
+                snprintf(buf, sizeof(buf), "{\"error\":\"log read failed\"}");
+                len = (int)strlen(buf);
+            }
+            resp_ok_json(fd, buf, len);
 
         } else if (strcmp(path, "/api/metrics") == 0) {
             char buf[BUF_METRICS];

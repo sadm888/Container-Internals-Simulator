@@ -256,6 +256,56 @@ body {
   min-width: 0;
 }
 
+.log-panel { min-height: 420px; }
+
+.log-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-4) var(--sp-5);
+  border-bottom: 1px solid var(--border);
+  background: var(--black-2);
+}
+
+.log-label {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.log-select {
+  min-width: 260px;
+  max-width: 100%;
+  border: 1px solid var(--border-md);
+  border-radius: var(--r);
+  background: var(--black-4);
+  color: var(--text);
+  padding: 8px 10px;
+  font: inherit;
+}
+
+.log-output {
+  min-height: 340px;
+  padding: var(--sp-4) var(--sp-5);
+}
+
+.log-meta {
+  margin-bottom: var(--sp-3);
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.log-pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
 /* ══════════════════════════════════════════════════════════════════════
    STAT CARDS
    ══════════════════════════════════════════════════════════════════════ */

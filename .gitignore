@@ -15,6 +15,7 @@ logs/
 rootfs/
 myrootfs/
 base/
+webbox/
 /tmp/container-sim/
 
 # editor

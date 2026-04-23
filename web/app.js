@@ -19,6 +19,7 @@ let firingSet       = new Set();
 let lastContainers  = [];
 let lastStats       = {};
 let lastMetrics     = {};
+let selectedLogId   = "";
 
 /* ── DOM helpers ────────────────────────────────────────────────────── */
 const $  = id => document.getElementById(id);
@@ -89,6 +90,7 @@ function initNav() {
 
       if (view === "metrics") renderMetricsView(lastMetrics);
       if (view === "images")  renderImages(lastContainers);
+      if (view === "logs")    renderLogSelector(lastContainers);
       refreshIcons();
     });
   });
@@ -306,6 +308,95 @@ function renderEvents(events) {
   setHtml("event-list", rows.join(""));
 }
 
+async function fetchLogPreview(id) {
+  const statusEl = $("log-status");
+
+  if (!id) {
+    if (statusEl) {
+      statusEl.textContent = "";
+      statusEl.classList.add("u-hidden");
+    }
+    setHtml("log-output", `
+      <div class="empty-state">
+        ${icon("scroll-text","icon-xl")}
+        <p>Select a container with captured logs</p>
+      </div>`);
+    refreshIcons();
+    return;
+  }
+
+  try {
+    const res = await fetch(`${API}/api/containers/${encodeURIComponent(id)}/logs?n=40`);
+    if (!res.ok) throw new Error("request failed");
+
+    const data = await res.json();
+    const lines = Array.isArray(data.lines) ? data.lines : [];
+
+    if (statusEl) {
+      statusEl.textContent = `${lines.length} lines`;
+      statusEl.classList.remove("u-hidden");
+    }
+
+    if (!data.log_path) {
+      setHtml("log-output", `
+        <div class="empty-state">
+          ${icon("file-x","icon-xl")}
+          <p>This container has no captured log file yet</p>
+        </div>`);
+      refreshIcons();
+      return;
+    }
+
+    if (lines.length === 0) {
+      setHtml("log-output", `
+        <div class="empty-state">
+          ${icon("file-text","icon-xl")}
+          <p>Log file exists, but there is no output yet</p>
+        </div>`);
+      refreshIcons();
+      return;
+    }
+
+    setHtml("log-output", `
+      <div class="log-meta">${escHtml(data.log_path)}</div>
+      <pre class="log-pre">${escHtml(lines.join("\n"))}</pre>`);
+  } catch (_) {
+    if (statusEl) {
+      statusEl.textContent = "";
+      statusEl.classList.add("u-hidden");
+    }
+    setHtml("log-output", `
+      <div class="empty-state">
+        ${icon("wifi-off","icon-xl")}
+        <p>Could not load logs right now</p>
+      </div>`);
+    refreshIcons();
+    return;
+  }
+
+  refreshIcons();
+}
+
+function renderLogSelector(containers) {
+  const select = $("log-select");
+  if (!select) return;
+
+  const candidates = containers.filter(c => c.log_path);
+  if (!selectedLogId || !candidates.some(c => c.id === selectedLogId)) {
+    selectedLogId = candidates[0]?.id || "";
+  }
+
+  select.innerHTML = candidates.length
+    ? candidates.map(c => `
+        <option value="${escHtml(c.id)}" ${c.id === selectedLogId ? "selected" : ""}>
+          ${escHtml(c.name)} · ${escHtml(c.id)}
+        </option>`).join("")
+    : `<option value="">No containers with logs</option>`;
+
+  select.disabled = candidates.length === 0;
+  fetchLogPreview(selectedLogId);
+}
+
 /* ── VIEW: Metrics ──────────────────────────────────────────────────── */
 function renderMetricsView(m) {
   if (!m || !Object.keys(m).length) return;
@@ -399,6 +490,9 @@ async function poll() {
     if ($("view-images")?.classList.contains("active-view"))
       renderImages(lastContainers);
 
+    if ($("view-logs")?.classList.contains("active-view"))
+      renderLogSelector(lastContainers);
+
 
   } catch(_) {
   }
@@ -415,6 +509,12 @@ function updateClock() {
 
 /* ── Boot ───────────────────────────────────────────────────────────── */
 initNav();
+if ($("log-select")) {
+  $("log-select").addEventListener("change", e => {
+    selectedLogId = e.target.value;
+    fetchLogPreview(selectedLogId);
+  });
+}
 if (typeof Chart !== "undefined") initCharts();
 updateClock();
 setInterval(updateClock, 1000);

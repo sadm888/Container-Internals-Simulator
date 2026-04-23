@@ -87,6 +87,7 @@ int container_net_summary(void);
 int container_logs(const char *id);
 int container_logs_tail(const char *id, int n);
 int container_logs_follow(const char *id);
+int container_logs_json_tail(const char *id, int n, char *buf, int buflen);
 int container_exec(const char *id, const char *command_line);
 int container_pause(const char *id);
 int container_unpause(const char *id);

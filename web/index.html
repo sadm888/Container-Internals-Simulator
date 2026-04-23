@@ -35,6 +35,10 @@
         <i data-lucide="activity" class="icon-xs"></i>
         Events
       </button>
+      <button type="button" class="tab" data-view="logs">
+        <i data-lucide="scroll-text" class="icon-xs"></i>
+        Logs
+      </button>
       <button type="button" class="tab" data-view="metrics">
         <i data-lucide="bar-chart-2" class="icon-xs"></i>
         Metrics
@@ -173,6 +177,29 @@
   </section>
 
   <!-- ══ Metrics ═══════════════════════════════════════════════════════ -->
+  <section id="view-logs" class="view">
+    <div class="view-header">
+      <div class="view-header-left">
+        <h1 class="view-title">Logs</h1>
+        <span id="log-status" class="view-count u-hidden"></span>
+      </div>
+    </div>
+    <div class="view-body">
+      <div class="panel log-panel">
+        <div class="log-toolbar">
+          <label class="log-label" for="log-select">Container</label>
+          <select id="log-select" class="log-select"></select>
+        </div>
+        <div id="log-output" class="log-output">
+          <div class="empty-state">
+            <i data-lucide="scroll-text" class="icon-xl"></i>
+            <p>Select a container with captured logs</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <section id="view-metrics" class="view">
     <div class="view-header">
       <div class="view-header-left">
