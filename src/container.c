@@ -133,7 +133,7 @@ static int save_metadata(void) {
     FILE *file = fopen(METADATA_FILE_TMP, "w");
     if (file == NULL) {
         printf("[error] failed to write container metadata\n\n");
-        log_event("metadata save failed: could not open temp file");
+        log_event_type("ERROR", "metadata save failed: could not open temp file");
         return -1;
     }
 
@@ -153,13 +153,13 @@ static int save_metadata(void) {
 
     if (fclose(file) != 0) {
         printf("[error] failed to flush container metadata\n\n");
-        log_event("metadata save failed: fclose");
+        log_event_type("ERROR", "metadata save failed: fclose");
         return -1;
     }
 
     if (rename(METADATA_FILE_TMP, METADATA_FILE) != 0) {
         printf("[error] failed to finalize container metadata\n\n");
-        log_event("metadata save failed: rename");
+        log_event_type("ERROR", "metadata save failed: rename");
         return -1;
     }
 
@@ -203,6 +203,27 @@ static void format_wait_status(int status, char *buffer, size_t buffer_size) {
     snprintf(buffer, buffer_size, "status=%d", status);
 }
 
+static void log_container_exit_status(const char *container_id, const char *prefix, int status) {
+    char reason[64];
+
+    if (container_id == NULL || prefix == NULL) {
+        return;
+    }
+
+    format_wait_status(status, reason, sizeof(reason));
+    if (WIFSIGNALED(status)) {
+        int signal_number = WTERMSIG(status);
+        if (signal_number == SIGXCPU) {
+            log_event_type("RESOURCE_LIMIT_HIT", "%s %s (%s)", container_id, prefix, reason);
+            return;
+        }
+        log_event_type("CONTAINER_STOPPED", "%s %s (%s)", container_id, prefix, reason);
+        return;
+    }
+
+    log_event_type("CONTAINER_STOPPED", "%s %s (%s)", container_id, prefix, reason);
+}
+
 static int sync_container_state(Container *container) {
     int state_changed = 0;
     int status = 0;
@@ -214,15 +235,13 @@ static int sync_container_state(Container *container) {
 
     result = waitpid(container->pid, &status, WNOHANG);
     if (result > 0) {
-        char reason[64];
         pid_t old_pid = container->pid;
 
         container->state = STATE_STOPPED;
         container->pid = -1;
         free_container_stack(container);
         container_scheduler_on_stopped(old_pid);
-        format_wait_status(status, reason, sizeof(reason));
-        log_event("%s exited and was reaped by manager (%s)", container->id, reason);
+        log_container_exit_status(container->id, "reaped by manager", status);
         return 1;
     }
 
@@ -234,7 +253,7 @@ static int sync_container_state(Container *container) {
         container->state = STATE_STOPPED;
         container->pid = -1;
         free_container_stack(container);
-        log_event("%s marked stopped after recovery check", container->id);
+        log_event_type("CONTAINER_STOPPED", "%s marked stopped after recovery check", container->id);
         state_changed = 1;
     }
 
@@ -251,6 +270,10 @@ static void poll_states(void) {
     if (changed) {
         save_metadata();
     }
+}
+
+void container_refresh_state(void) {
+    poll_states();
 }
 
 static int normalize_resource_limits(ResourceConfig *limits) {
@@ -305,7 +328,6 @@ static int move_terminal_foreground(pid_t pgrp) {
 
 static int wait_for_container_process(Container *container, int quiet) {
     int status = 0;
-    char reason[64];
     pid_t shell_pgrp = getpgrp();
     int terminal_moved = 0;
 
@@ -333,8 +355,7 @@ static int wait_for_container_process(Container *container, int quiet) {
         (void)move_terminal_foreground(shell_pgrp);
     }
 
-    format_wait_status(status, reason, sizeof(reason));
-    log_event("%s finished (%s)", container->id, reason);
+    log_container_exit_status(container->id, "finished", status);
     container->pid = -1;
     container->state = STATE_STOPPED;
     free_container_stack(container);
@@ -362,7 +383,7 @@ static int stop_container_process(Container *container, int quiet) {
         if (!quiet) {
             printf("[error] failed to stop %s\n\n", container->id);
         }
-        log_event("failed to stop %s (pid %d)", container->id, container->pid);
+        log_event_type("ERROR", "failed to stop %s (pid %d)", container->id, container->pid);
         return -1;
     }
 
@@ -370,11 +391,11 @@ static int stop_container_process(Container *container, int quiet) {
         if (!quiet) {
             printf("[error] failed to reap %s\n\n", container->id);
         }
-        log_event("failed to reap %s (pid %d)", container->id, container->pid);
+        log_event_type("ERROR", "failed to reap %s (pid %d)", container->id, container->pid);
         return -1;
     }
 
-    log_event("%s STOPPED (pid %d)", container->id, container->pid);
+    log_event_type("CONTAINER_STOPPED", "%s stopped (pid %d)", container->id, container->pid);
     container_scheduler_on_stopped(container->pid);
     container->pid = -1;
     container->state = STATE_STOPPED;
@@ -501,7 +522,7 @@ int container_manager_init(void) {
         printf("[manager] restored %d container record(s) from %s\n\n",
                restored,
                METADATA_FILE);
-        log_event("restored %d container record(s)", restored);
+        log_event_type("MANAGER", "restored %d container record(s)", restored);
     }
 
     return 0;
@@ -573,15 +594,16 @@ int container_create(const ContainerSpec *spec, char *out_id, size_t out_id_size
 
     printf("[manager] created %s\n", container->id);
     print_container_banner(container, -1);
-    log_event("%s CREATED (name=%s hostname=%s rootfs=%s command=%s cpu=%us mem=%uMB nproc=%u)",
-              container->id,
-              container->name,
-              container->hostname,
-              container->rootfs,
-              container->command_line,
-              container->resource_limits.cpu_seconds,
-              container->resource_limits.memory_mb,
-              container->resource_limits.max_processes);
+    log_event_type("CONTAINER_CREATED",
+                   "%s name=%s hostname=%s rootfs=%s command=%s cpu=%us mem=%uMB nproc=%u",
+                   container->id,
+                   container->name,
+                   container->hostname,
+                   container->rootfs,
+                   container->command_line,
+                   container->resource_limits.cpu_seconds,
+                   container->resource_limits.memory_mb,
+                   container->resource_limits.max_processes);
     return 0;
 }
 
@@ -670,7 +692,7 @@ static int start_container_by_id(const char *id, int schedule_target) {
         saved_errno = errno;
         print_start_error(container, saved_errno);
         format_start_error_message(saved_errno, message, sizeof(message));
-        log_event("startup isolation failed for %s: %s", container->id, message);
+        log_event_type("ERROR", "startup isolation failed for %s: %s", container->id, message);
         free_container_stack(container);
         return -1;
     }
@@ -685,15 +707,16 @@ static int start_container_by_id(const char *id, int schedule_target) {
 
     printf("[manager] started %s\n", container->id);
     print_container_banner(container, start_result.namespace_pid);
-    log_event("%s STARTED (pid %d, ns_pid %d, isolation=%s, command=%s, cpu=%us mem=%uMB nproc=%u)",
-              container->id,
-              container->pid,
-              start_result.namespace_pid,
-              namespace_profile(),
-              container->command_line,
-              container->resource_limits.cpu_seconds,
-              container->resource_limits.memory_mb,
-              container->resource_limits.max_processes);
+    log_event_type("CONTAINER_STARTED",
+                   "%s pid=%d ns_pid=%d isolation=%s command=%s cpu=%us mem=%uMB nproc=%u",
+                   container->id,
+                   container->pid,
+                   start_result.namespace_pid,
+                   namespace_profile(),
+                   container->command_line,
+                   container->resource_limits.cpu_seconds,
+                   container->resource_limits.memory_mb,
+                   container->resource_limits.max_processes);
 
     if (schedule_target) {
         container_scheduler_on_started(container->pid);
@@ -793,7 +816,7 @@ int container_delete(const char *id) {
         return -1;
     }
 
-    log_event("%s DELETED", container->id);
+    log_event_type("CONTAINER_DELETED", "%s deleted", container->id);
     printf("[manager] deleted %s\n\n", container->id);
     free_container_stack(container);
     free(container);

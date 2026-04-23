@@ -59,6 +59,7 @@ int container_stats(const char *id);
 int container_stats_all(void);
 int container_stats_watch(const char *id, unsigned int interval_sec);
 int container_stats_all_watch(unsigned int interval_sec);
+void container_refresh_state(void);
 
 /* Ctrl+C handling for watch loops / CLI. */
 void container_request_interrupt(void);

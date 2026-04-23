@@ -45,6 +45,7 @@ static void print_help(void) {
     printf("  stop <id>\n");
     printf("  delete <id>\n");
     printf("  list\n");
+    printf("  logs [-f] [-n N] [id]  (view overall or container-specific logs)\n");
     printf("  stats                 (shows stats for all running containers)\n");
     printf("  stats <id>\n");
     printf("  stats --watch <sec>   (live stats for all running containers)\n");
@@ -107,7 +108,7 @@ int main(void) {
 
     print_banner();
     print_help();
-    log_event("=== simulator started ===");
+    log_event_type("SIMULATOR_STARTED", "interactive CLI started");
 
     while (1) {
         char *args[32] = {0};
@@ -124,7 +125,7 @@ int main(void) {
             }
             printf("\n");
             cleanup_all_containers();
-            log_event("=== simulator stopped ===");
+            log_event_type("SIMULATOR_STOPPED", "CLI stopped after input closed");
             break;
         }
 
@@ -237,10 +238,15 @@ int main(void) {
                 printf("[manager] scheduler enabled (%s, slice=%ums)\n\n",
                        scheduler_profile(),
                        scheduler_get_time_slice_ms());
+                log_event_type("SCHEDULER_ENABLED",
+                               "profile=%s slice=%ums",
+                               scheduler_profile(),
+                               scheduler_get_time_slice_ms());
             } else if (strcmp(args[1], "off") == 0) {
                 scheduler_set_enabled(0);
                 container_scheduler_refresh_targets();
                 printf("[manager] scheduler disabled\n\n");
+                log_event_type("SCHEDULER_DISABLED", "scheduler disabled");
             } else if (strcmp(args[1], "slice") == 0) {
                 unsigned int ms = 0;
                 if (argc != 3) {
@@ -253,6 +259,7 @@ int main(void) {
                     continue;
                 }
                 printf("[manager] scheduler slice set to %ums\n\n", scheduler_get_time_slice_ms());
+                log_event_type("SCHEDULER_UPDATED", "time_slice_ms=%u", scheduler_get_time_slice_ms());
             } else if (strcmp(args[1], "status") == 0) {
                 printf("[manager] scheduler: %s, slice=%ums, mode=%s\n\n",
                        scheduler_profile(),
@@ -285,6 +292,43 @@ int main(void) {
                 continue;
             }
             container_list();
+        } else if (strcmp(args[0], "logs") == 0) {
+            const char *container_id = NULL;
+            int follow = 0;
+            int tail_lines = -1;
+            int index = 1;
+
+            while (index < argc) {
+                if (strcmp(args[index], "-f") == 0 || strcmp(args[index], "--follow") == 0) {
+                    follow = 1;
+                    index++;
+                    continue;
+                }
+                if ((strcmp(args[index], "-n") == 0 || strcmp(args[index], "--tail") == 0) && index + 1 < argc) {
+                    tail_lines = (int)strtol(args[index + 1], NULL, 10);
+                    index += 2;
+                    continue;
+                }
+                if (container_id == NULL) {
+                    container_id = args[index];
+                    index++;
+                    continue;
+                }
+                break;
+            }
+
+            if (index != argc) {
+                printf("[error] usage: logs [-f] [-n N] [id]\n\n");
+                continue;
+            }
+
+            if (follow) {
+                logger_follow(container_id, tail_lines);
+            } else if (tail_lines >= 0) {
+                logger_tail(container_id, tail_lines);
+            } else {
+                logger_print(container_id);
+            }
         } else if (strcmp(args[0], "stats") == 0) {
             if (argc == 1) {
                 container_stats_all();
@@ -303,11 +347,12 @@ int main(void) {
             print_help();
         } else if (strcmp(args[0], "exit") == 0) {
             cleanup_all_containers();
-            log_event("=== simulator stopped ===");
+            log_event_type("SIMULATOR_STOPPED", "CLI stopped by user command");
             printf("bye.\n");
             break;
         } else {
             printf("[error] unknown command: '%s'\n\n", args[0]);
+            log_event_type("ERROR", "unknown command '%s'", args[0]);
         }
     }
 
