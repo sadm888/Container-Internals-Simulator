@@ -27,6 +27,10 @@ static Container *tail = NULL;
 static int next_sequence = 1;
 static volatile sig_atomic_t g_interrupt_requested = 0;
 
+static void print_cli_rule(void) {
+    printf("========================================================================================================================\n");
+}
+
 void container_request_interrupt(void) {
     g_interrupt_requested = 1;
 }
@@ -420,22 +424,27 @@ static void print_container_banner(const Container *container, pid_t namespace_p
     }
 
     printf("\n");
-    printf("  id       : %s\n", container->id);
-    printf("  name     : %s\n", container->name);
-    printf("  pid      : %s\n", pid_text);
-    printf("  hostname : %s\n", container->hostname);
-    printf("  rootfs   : %s\n", container->rootfs);
-    printf("  command  : %s\n", container->command_line);
+    print_cli_rule();
+    printf("Container Summary\n");
+    print_cli_rule();
+    printf("%-10s : %s\n", "id", container->id);
+    printf("%-10s : %s\n", "name", container->name);
+    printf("%-10s : %s\n", "pid", pid_text);
+    printf("%-10s : %s\n", "hostname", container->hostname);
+    printf("%-10s : %s\n", "rootfs", container->rootfs);
+    printf("%-10s : %s\n", "command", container->command_line);
     resource_format_limits(&container->resource_limits, limits_text, sizeof(limits_text));
-    printf("  limits   : %s\n", limits_text);
-    printf("  isolate  : %s\n", namespace_profile());
-    printf("  fs mode  : %s\n", filesystem_profile());
-    printf("  net mode : %s\n", network_profile());
-    printf("  res mode : %s\n", resource_profile());
+    printf("%-10s : %s\n", "limits", limits_text);
+    printf("%-10s : %s\n", "isolate", namespace_profile());
+    printf("%-10s : %s\n", "fs mode", filesystem_profile());
+    printf("%-10s : %s\n", "net mode", network_profile());
+    printf("%-10s : %s\n", "res mode", resource_profile());
     if (namespace_pid > 0) {
-        printf("  ns pid   : %d\n", (int)namespace_pid);
+        printf("%-10s : %d\n", "ns pid", (int)namespace_pid);
     }
-    printf("  state    : %s\n\n", state_to_string(container->state));
+    printf("%-10s : %s\n", "state", state_to_string(container->state));
+    print_cli_rule();
+    printf("\n");
 }
 
 static void print_start_error(const Container *container, int error_number) {
@@ -829,9 +838,15 @@ int container_list(void) {
     poll_states();
 
     printf("\n");
-    printf("Isolation profile: %s\n", namespace_profile());
-    printf("Filesystem profile: %s\n", filesystem_profile());
-    printf("%-16s %-16s %-8s %-16s %-28s %-10s %-24s %-24s\n",
+    print_cli_rule();
+    printf("Container Inventory\n");
+    print_cli_rule();
+    printf("Isolation  : %s\n", namespace_profile());
+    printf("Filesystem : %s\n", filesystem_profile());
+    printf("Network    : %s\n", network_profile());
+    printf("Resources  : %s\n", resource_profile());
+    print_cli_rule();
+    printf("%-16s %-14s %-8s %-14s %-24s %-10s %-22s %-22s\n",
            "ID",
            "NAME",
            "PID",
@@ -840,7 +855,7 @@ int container_list(void) {
            "STATE",
            "COMMAND",
            "LIMITS");
-    printf("-------------------------------------------------------------------------------------------------------------------------------------------------\n");
+    print_cli_rule();
 
     for (Container *cursor = head; cursor != NULL; cursor = cursor->next) {
         char pid_text[16];
@@ -854,7 +869,7 @@ int container_list(void) {
         char limits_text[128];
 
         resource_format_limits(&cursor->resource_limits, limits_text, sizeof(limits_text));
-        printf("%-16s %-16s %-8s %-16s %-28s %-10s %-24s %-24s\n",
+        printf("%-16s %-14s %-8s %-14s %-24s %-10s %-22s %-22s\n",
                cursor->id,
                cursor->name,
                pid_text,
@@ -876,7 +891,11 @@ int container_list(void) {
 
 static void print_stats_header(void) {
     printf("\n");
+    print_cli_rule();
+    printf("Container Monitoring\n");
+    print_cli_rule();
     printf("Monitor profile: %s\n", monitor_profile());
+    print_cli_rule();
     printf("%-16s %-8s %-6s %-10s %-8s %-10s %-10s %-6s %-24s\n",
            "ID",
            "PID",
@@ -887,7 +906,7 @@ static void print_stats_header(void) {
            "VSZ(MB)",
            "THR",
            "COMMAND");
-    printf("---------------------------------------------------------------------------------------------------------------\n");
+    print_cli_rule();
 }
 
 static void print_stats_row(const Container *container, const MonitorStats *stats, int has_cpu_pct, double cpu_pct) {

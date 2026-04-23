@@ -13,12 +13,23 @@ static void on_sigint(int sig) {
     container_request_interrupt();
 }
 
+static void print_rule(void) {
+    printf("======================================================================\n");
+}
+
+static void print_section(const char *title) {
+    print_rule();
+    printf("%s\n", title);
+    print_rule();
+}
+
 static void print_banner(void) {
     printf("╔══════════════════════════════════════════════════════╗\n");
     printf("║         Container Internals Simulator                ║\n");
-    printf("║         Modules 1-8: Runtime + Monitoring            ║\n");
-    printf("║         NS | FS | Limits | Sched | Netns | Stats     ║\n");
-    printf("╚══════════════════════════════════════════════════════╝\n\n");
+    printf("║         Runtime + Isolation + Monitoring             ║\n");
+    printf("║         NS | FS | Limits | Sched | Netns | Logs      ║\n");
+    printf("╚══════════════════════════════════════════════════════╝\n");
+    printf("\n");
 }
 
 static int parse_command(char *line, char **args, int max_args) {
@@ -34,22 +45,30 @@ static int parse_command(char *line, char **args, int max_args) {
 }
 
 static void print_help(void) {
-    printf("Commands:\n");
-    printf("  run [--cpu SEC] [--mem MB] [--pids N] <name> <hostname> <rootfs> <command> [args...]\n");
+    print_section("Command Reference");
+    printf("Lifecycle\n");
+    printf("  run   [--cpu SEC] [--mem MB] [--pids N] <name> <hostname> <rootfs> <command> [args...]\n");
     printf("  runbg [--cpu SEC] [--mem MB] [--pids N] <name> <hostname> <rootfs> <command> [args...]\n");
     printf("  create [--cpu SEC] [--mem MB] [--pids N] [name] [hostname] [rootfs]\n");
-    printf("  sched on|off\n");
+    printf("  start <id>    start a created container with namespaces and isolated rootfs\n");
+    printf("  stop <id>     stop a running container\n");
+    printf("  delete <id>   delete a stopped container record\n");
+    printf("  list          show all container records\n");
+    printf("\n");
+    printf("Scheduling\n");
+    printf("  sched on\n");
+    printf("  sched off\n");
     printf("  sched slice <ms>\n");
     printf("  sched status\n");
-    printf("  start <id>   (starts with namespaces and isolated rootfs)\n");
-    printf("  stop <id>\n");
-    printf("  delete <id>\n");
-    printf("  list\n");
-    printf("  logs [-f] [-n N] [id]  (view overall or container-specific logs)\n");
-    printf("  stats                 (shows stats for all running containers)\n");
-    printf("  stats <id>\n");
-    printf("  stats --watch <sec>   (live stats for all running containers)\n");
-    printf("  stats --watch <sec> <id>\n");
+    printf("\n");
+    printf("Observability\n");
+    printf("  logs [-f] [-n N] [id]           view overall or container-specific logs\n");
+    printf("  stats                           show stats for all running containers\n");
+    printf("  stats <id>                      show stats for one container\n");
+    printf("  stats --watch <sec>             live stats for all running containers\n");
+    printf("  stats --watch <sec> <id>        live stats for one container\n");
+    printf("\n");
+    printf("General\n");
     printf("  help\n");
     printf("  exit\n\n");
 }
