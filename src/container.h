@@ -102,6 +102,8 @@ int container_exec_quiet(const char *id, const char *command_line);
 void container_refresh_state(void);
 int container_json_all(char *buf, int buflen);
 int container_stats_json_all(char *buf, int buflen);
+int container_inspect_json(const char *id, char *buf, int buflen);
+int container_network_json(char *buf, int buflen);
 int container_send_signal(const char *id, int sig);
 
 /* Ctrl+C handling for watch loops / CLI. */

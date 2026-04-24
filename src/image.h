@@ -34,4 +34,7 @@ int image_inspect(const char *ref);
 /* Remove an image record (does not delete the rootfs directory). */
 int image_remove(const char *name, const char *tag);
 
+/* Serialise all image records as a JSON array. Returns bytes written. */
+int image_list_json(char *buf, int buflen);
+
 #endif

@@ -43,6 +43,18 @@
         <i data-lucide="bar-chart-2" class="icon-xs"></i>
         Metrics
       </button>
+      <button type="button" class="tab" data-view="network">
+        <i data-lucide="network" class="icon-xs"></i>
+        Network
+      </button>
+      <button type="button" class="tab" data-view="scheduler">
+        <i data-lucide="cpu" class="icon-xs"></i>
+        Scheduler
+      </button>
+      <button type="button" class="tab" data-view="orch">
+        <i data-lucide="boxes" class="icon-xs"></i>
+        Orch
+      </button>
     </div>
   </nav>
 
@@ -211,6 +223,86 @@
         <table class="metrics-table">
           <tbody id="metrics-tbody"></tbody>
         </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══ Network ══════════════════════════════════════════════════════ -->
+  <section id="view-network" class="view">
+    <div class="view-header">
+      <div class="view-header-left">
+        <h1 class="view-title">Network</h1>
+        <span id="network-status" class="view-count u-hidden"></span>
+      </div>
+    </div>
+    <div class="view-body">
+      <div class="panel">
+        <div id="network-bridge" class="stat-row"></div>
+      </div>
+      <div class="panel">
+        <div id="network-list">
+          <div class="empty-state">
+            <i data-lucide="network" class="icon-xl"></i>
+            <p>No networked containers yet</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══ Scheduler ═════════════════════════════════════════════════════ -->
+  <section id="view-scheduler" class="view">
+    <div class="view-header">
+      <div class="view-header-left">
+        <h1 class="view-title">Scheduler</h1>
+      </div>
+    </div>
+    <div class="view-body">
+      <div class="panel">
+        <div class="stat-row">
+          <div class="stat-card">
+            <div class="stat-icon green"><i data-lucide="toggle-right" class="icon-xs"></i></div>
+            <div>
+              <div class="stat-value" id="sched-enabled">—</div>
+              <div class="stat-label">Status</div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon sky"><i data-lucide="timer" class="icon-xs"></i></div>
+            <div>
+              <div class="stat-value" id="sched-slice">—</div>
+              <div class="stat-label">Time Slice</div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon purple"><i data-lucide="layers" class="icon-xs"></i></div>
+            <div>
+              <div class="stat-value" id="sched-targets">—</div>
+              <div class="stat-label">Targets</div>
+            </div>
+          </div>
+        </div>
+        <div class="sched-profile-note" id="sched-profile"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══ Orchestrator ══════════════════════════════════════════════════ -->
+  <section id="view-orch" class="view">
+    <div class="view-header">
+      <div class="view-header-left">
+        <h1 class="view-title">Orchestrator</h1>
+        <span id="orch-spec-name" class="view-count u-hidden"></span>
+      </div>
+    </div>
+    <div class="view-body">
+      <div class="panel">
+        <div id="orch-list">
+          <div class="empty-state">
+            <i data-lucide="boxes" class="icon-xl"></i>
+            <p>No spec running — use <code>orch run &lt;spec.json&gt;</code> in the CLI</p>
+          </div>
+        </div>
       </div>
     </div>
   </section>

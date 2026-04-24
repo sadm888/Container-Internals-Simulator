@@ -107,4 +107,7 @@ void orch_print_graph(OrchestratorSpec *spec);
 /* Top-level CLI dispatcher for the "orch" command. */
 int  cmd_orch(int argc, char **argv);
 
+/* Serialise live orchestrator status as JSON. Returns bytes written. */
+int  orch_status_json(char *buf, int buflen);
+
 #endif

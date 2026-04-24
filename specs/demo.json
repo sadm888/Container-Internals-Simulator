@@ -3,25 +3,25 @@
   "services": {
     "db": {
       "image": "base",
-      "command": "/bin/sh -c 'echo db-started && sleep 30'",
+      "command": "/bin/sh -c 'echo db-started && sleep 9999'",
       "restart": "always",
       "health_check": {
         "exec": "/bin/true",
-        "interval_ms": 3000,
+        "interval_ms": 500,
         "retries": 3,
-        "start_period_ms": 500
+        "start_period_ms": 100
       }
     },
     "web": {
       "image": "base",
-      "command": "/bin/sh -c 'echo web-started && sleep 25'",
+      "command": "/bin/sh -c 'echo web-started && sleep 9999'",
       "depends_on": ["db"],
       "restart": "on-failure",
       "health_check": {
         "exec": "/bin/true",
-        "interval_ms": 4000,
+        "interval_ms": 500,
         "retries": 2,
-        "start_period_ms": 1000
+        "start_period_ms": 100
       }
     }
   }

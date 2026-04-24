@@ -657,6 +657,33 @@ body {
 .anim-pulse { animation:pulse-opacity 2s ease-in-out infinite; will-change:opacity; }
 .anim-spin  { animation:spin .8s linear infinite; will-change:transform; }
 
+/* ── New views ──────────────────────────────────────────────────────── */
+.sched-profile-note { padding:0 1rem 1rem; color:var(--text-muted); font-size:0.8rem; }
+
+.net-row { display:grid; grid-template-columns:1fr 1fr 1fr 1fr 1fr; gap:.5rem;
+           padding:.5rem 1rem; border-bottom:1px solid var(--black-3); font-size:13px; }
+.net-row:last-child { border-bottom:none; }
+.net-header { font-weight:600; font-size:11px; color:var(--text-muted);
+              text-transform:uppercase; letter-spacing:.05em; }
+.net-bridge-badge { display:inline-flex; align-items:center; gap:.35rem;
+                    padding:.2rem .7rem; border-radius:999px; font-size:12px;
+                    font-weight:600; }
+.net-bridge-badge.up   { background:rgba(74,222,128,.15); color:#4ade80; }
+.net-bridge-badge.down { background:rgba(248,113,113,.15); color:#f87171; }
+
+.orch-row { display:grid; grid-template-columns:1.5fr 1fr 1fr 1fr 2fr; gap:.5rem;
+            padding:.6rem 1rem; border-bottom:1px solid var(--black-3); font-size:13px; }
+.orch-row:last-child { border-bottom:none; }
+.orch-header { font-weight:600; font-size:11px; color:var(--text-muted);
+               text-transform:uppercase; letter-spacing:.05em; }
+.orch-state-healthy    { color:#4ade80; font-weight:600; }
+.orch-state-unhealthy  { color:#f87171; font-weight:600; }
+.orch-state-running    { color:#60a5fa; }
+.orch-state-failed     { color:#f87171; }
+.orch-state-restarting { color:#fbbf24; }
+.orch-state-stopped    { color:var(--text-muted); }
+.orch-state-pending,.orch-state-starting { color:var(--text-muted); }
+
 /* ══════════════════════════════════════════════════════════════════════
    SCROLLBAR
    ══════════════════════════════════════════════════════════════════════ */
@@ -664,3 +691,4 @@ body {
 ::-webkit-scrollbar-track { background:transparent; }
 ::-webkit-scrollbar-thumb { background:var(--black-5); border-radius:3px; }
 ::-webkit-scrollbar-thumb:hover { background:var(--purple); }
+

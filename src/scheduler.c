@@ -2,6 +2,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -266,5 +267,24 @@ void scheduler_clear_targets(void) {
 
 const char *scheduler_profile(void) {
     return SCHEDULER_PROFILE;
+}
+
+int scheduler_json(char *buf, int buflen) {
+    int enabled;
+    unsigned int slice_ms;
+    size_t target_count;
+
+    pthread_mutex_lock(&g_state.mutex);
+    enabled      = g_state.enabled;
+    slice_ms     = g_state.time_slice_ms;
+    target_count = g_state.target_count;
+    pthread_mutex_unlock(&g_state.mutex);
+
+    return snprintf(buf, (size_t)buflen,
+        "{\"enabled\":%s,\"time_slice_ms\":%u,\"target_count\":%zu,\"profile\":\"%s\"}",
+        enabled ? "true" : "false",
+        slice_ms,
+        target_count,
+        SCHEDULER_PROFILE);
 }
 

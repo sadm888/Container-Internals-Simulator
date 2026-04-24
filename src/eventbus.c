@@ -1,4 +1,6 @@
+#include <inttypes.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,7 +15,7 @@
 /* ── ring buffer state ───────────────────────────────────────────────── */
 
 static Event           g_ring[EVENTBUS_RING_SIZE];
-static unsigned        g_total = 0;
+static uint64_t        g_total = 0;
 static pthread_mutex_t g_lock  = PTHREAD_MUTEX_INITIALIZER;
 static FILE           *g_logfile = NULL;   /* append-only persistence */
 
@@ -99,7 +101,7 @@ static int parse_event_line(char *line, Event *e) {
     char *nl = strchr(fields[5], '\n');
     if (nl) *nl = '\0';
 
-    e->seq       = (unsigned)strtoul(fields[0], NULL, 10);
+    e->seq       = (uint64_t)strtoull(fields[0], NULL, 10);
     e->timestamp = (time_t)strtol(fields[1], NULL, 10);
     e->value     = strtol(fields[5], NULL, 10);
 
@@ -130,7 +132,7 @@ static void replay_events_file(void) {
     Event *window = calloc(EVENTBUS_RING_SIZE, sizeof(Event));
     if (!window) { fclose(f); return; }
 
-    unsigned count = 0;
+    uint64_t count = 0;
     char line[512];
     while (fgets(line, sizeof(line), f)) {
         Event e = {0};
@@ -144,13 +146,13 @@ static void replay_events_file(void) {
     if (count == 0) { free(window); return; }
 
     /* Replay into ring, preserving original sequence numbers */
-    unsigned loaded = (count < EVENTBUS_RING_SIZE) ? count : EVENTBUS_RING_SIZE;
-    unsigned start  = count - loaded;   /* first slot in window to use */
+    uint64_t loaded = (count < EVENTBUS_RING_SIZE) ? count : EVENTBUS_RING_SIZE;
+    uint64_t start  = count - loaded;   /* first slot in window to use */
 
     pthread_mutex_lock(&g_lock);
-    for (unsigned i = 0; i < loaded; i++) {
+    for (uint64_t i = 0; i < loaded; i++) {
         const Event *e = &window[(start + i) & EVENTBUS_RING_MASK];
-        unsigned slot  = e->seq & EVENTBUS_RING_MASK;
+        uint64_t slot  = e->seq & EVENTBUS_RING_MASK;
         g_ring[slot]   = *e;
     }
     /* Advance g_total to one past the highest replayed seq */
@@ -187,8 +189,8 @@ const char *eventbus_type_name(EventType type) {
     return g_type_names[type] ? g_type_names[type] : "UNKNOWN";
 }
 
-unsigned eventbus_total(void) {
-    unsigned t;
+uint64_t eventbus_total(void) {
+    uint64_t t;
     pthread_mutex_lock(&g_lock);
     t = g_total;
     pthread_mutex_unlock(&g_lock);
@@ -218,14 +220,14 @@ void eventbus_emit(EventType   type,
 
     pthread_mutex_lock(&g_lock);
     e.seq = g_total;
-    slot  = g_total & EVENTBUS_RING_MASK;
+    slot  = (unsigned)(g_total & EVENTBUS_RING_MASK);
     g_ring[slot] = e;
     g_total++;
     pthread_mutex_unlock(&g_lock);
 
     /* Persist to events.log: seq\tts\ttype\tcid\tdetail\tvalue */
     if (g_logfile) {
-        fprintf(g_logfile, "%u\t%ld\t%s\t%s\t%s\t%ld\n",
+        fprintf(g_logfile, "%" PRIu64 "\t%ld\t%s\t%s\t%s\t%ld\n",
                 e.seq,
                 (long)e.timestamp,
                 eventbus_type_name(e.type),
@@ -259,7 +261,7 @@ static void print_event(const Event *e) {
     strftime(tbuf, sizeof(tbuf), "%H:%M:%S", tm_info);
 
     /* Format: [HH:MM:SS] #SEQ  TYPE                 id=XXX  detail  (val=N) */
-    printf("  [%s] #%-4u  %-30s", tbuf, e->seq, eventbus_type_name(e->type));
+    printf("  [%s] #%-4" PRIu64 "  %-30s", tbuf, e->seq, eventbus_type_name(e->type));
 
     if (e->container_id[0])
         printf("  id=%-18s", e->container_id);
@@ -353,7 +355,7 @@ int eventbus_json_recent(int n, char *buf, int buflen) {
 
         written += snprintf(buf + written, (size_t)(buflen - written),
             "%s{"
-            "\"seq\":%u,"
+            "\"seq\":%" PRIu64 ","
             "\"type\":\"%s\","
             "\"timestamp\":\"%s\","
             "\"container_id\":\"%s\","
@@ -379,8 +381,8 @@ int eventbus_json_recent(int n, char *buf, int buflen) {
     return written;
 }
 
-unsigned eventbus_drain_from(unsigned from_seq) {
-    unsigned total, i;
+uint64_t eventbus_drain_from(uint64_t from_seq) {
+    uint64_t total, i;
 
     pthread_mutex_lock(&g_lock);
     total = g_total;

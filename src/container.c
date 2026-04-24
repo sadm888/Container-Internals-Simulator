@@ -224,12 +224,20 @@ static void remove_container(Container *container) {
 }
 
 static Container *find_container(const char *id) {
-    for (Container *cursor = head; cursor != NULL; cursor = cursor->next) {
-        if (strcmp(cursor->id, id) == 0) {
-            return cursor;
-        }
+    /* 1. Exact ID match */
+    for (Container *c = head; c != NULL; c = c->next)
+        if (strcmp(c->id, id) == 0) return c;
+
+    /* 2. Name match — prefer running/paused over stopped */
+    Container *best = NULL;
+    for (Container *c = head; c != NULL; c = c->next) {
+        if (strcmp(c->name, id) != 0) continue;
+        if (c->state == STATE_RUNNING || c->state == STATE_PAUSED)
+            return c;            /* running is always best */
+        if (best == NULL)
+            best = c;            /* keep first stopped as fallback */
     }
-    return NULL;
+    return best;
 }
 
 static void free_container_stack(Container *container) {
@@ -801,6 +809,10 @@ int container_manager_init(void) {
         if (container == NULL) {
             fclose(file);
             printf("[error] out of memory while restoring containers\n\n");
+            /* Free all containers already added to the linked list */
+            Container *cur = head, *nxt;
+            while (cur) { nxt = cur->next; free(cur); cur = nxt; }
+            head = tail = NULL;
             return -1;
         }
 
@@ -1344,6 +1356,8 @@ int container_delete(const char *id) {
         printf("[error] unpause %s before deleting it\n\n", container->id);
         return -1;
     }
+
+    cleanup_container_network(container);
 
     remove_container(container);
     if (save_metadata() != 0) {
@@ -1967,20 +1981,29 @@ int container_inspect(const char *id) {
             snprintf(exit_buf, sizeof(exit_buf), "%d", container->exit_code);
         }
 
+        char _ej_name[CONTAINER_NAME_LEN*2], _ej_cmd[CONTAINER_COMMAND_LEN*2];
+        char _ej_rootfs[CONTAINER_ROOTFS_LEN*2], _ej_host[CONTAINER_HOSTNAME_LEN*2];
+        char _ej_image[IMAGE_REF_LEN*2];
+        json_escape_copy(_ej_name,   sizeof(_ej_name),   container->name);
+        json_escape_copy(_ej_cmd,    sizeof(_ej_cmd),     container->command_line);
+        json_escape_copy(_ej_rootfs, sizeof(_ej_rootfs), container->rootfs);
+        json_escape_copy(_ej_host,   sizeof(_ej_host),   container->hostname);
+        json_escape_copy(_ej_image,  sizeof(_ej_image),
+                         container->image_ref[0] ? container->image_ref : "(none)");
+
         printf("{\n");
         printf("  \"Id\"         : \"%s\",\n", container->id);
-        printf("  \"Name\"       : \"%s\",\n", container->name);
-        printf("  \"Image\"      : \"%s\",\n",
-               container->image_ref[0] ? container->image_ref : "(none)");
+        printf("  \"Name\"       : \"%s\",\n", _ej_name);
+        printf("  \"Image\"      : \"%s\",\n", _ej_image);
         printf("  \"Pid\"        : %d,\n", (int)container->pid);
         printf("  \"State\"      : \"%s\",\n", state_to_string(container->state));
         printf("  \"ExitCode\"   : \"%s\",\n", exit_buf);
         printf("  \"StartedAt\"  : \"%s\",\n", started_buf);
         printf("  \"StoppedAt\"  : \"%s\",\n", stopped_buf);
         printf("  \"Uptime\"     : \"%s\",\n", uptime_buf);
-        printf("  \"Hostname\"   : \"%s\",\n", container->hostname);
-        printf("  \"Rootfs\"     : \"%s\",\n", container->rootfs);
-        printf("  \"Command\"    : \"%s\",\n", container->command_line);
+        printf("  \"Hostname\"   : \"%s\",\n", _ej_host);
+        printf("  \"Rootfs\"     : \"%s\",\n", _ej_rootfs);
+        printf("  \"Command\"    : \"%s\",\n", _ej_cmd);
         printf("  \"LogPath\"    : \"%s\",\n",
                container->log_path[0] ? container->log_path : "(none)");
         printf("  \"Limits\"     : {\n");
@@ -2041,20 +2064,53 @@ int container_inspect(const char *id) {
     return 0;
 }
 
+/* Enter the UTS, NET and (best-effort) MNT namespaces of a running container.
+ * Called in the child process after fork().  quiet=1 suppresses stdout/stderr. */
+static void exec_enter_namespaces(pid_t pid, int quiet) {
+    static const char *ns_names[] = {"uts", "net", "mnt"};
+    static const int   ns_types[] = {CLONE_NEWUTS, CLONE_NEWNET, CLONE_NEWNS};
+    int ns_fds[3] = {-1, -1, -1};
+    char ns_path[128];
+    int i;
+
+    if (quiet) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+    }
+
+    for (i = 0; i < 3; i++) {
+        snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/%s", (int)pid, ns_names[i]);
+        ns_fds[i] = open(ns_path, O_RDONLY);
+    }
+
+    /* UTS + NET: best-effort */
+    for (i = 0; i < 2; i++) {
+        if (ns_fds[i] >= 0) { setns(ns_fds[i], ns_types[i]); close(ns_fds[i]); }
+    }
+
+    /* MNT: try setns first, fall back to /proc/<pid>/root chdir+chroot */
+    if (ns_fds[2] >= 0) {
+        if (setns(ns_fds[2], CLONE_NEWNS) == 0) {
+            chdir("/");
+        } else {
+            char root_path[128];
+            snprintf(root_path, sizeof(root_path), "/proc/%d/root", (int)pid);
+            if (chdir(root_path) == 0) { chroot("."); chdir("/"); }
+        }
+        close(ns_fds[2]);
+    }
+}
+
 int container_exec(const char *id, const char *command_line) {
     Container *container = NULL;
     char cmd_buf[256];
     char *argv[32];
-    int argc = 0;
-    /* uts, net, mnt — entered in this order; mnt is best-effort */
-    const char *ns_names[] = {"uts", "net", "mnt"};
-    int ns_types[]          = {CLONE_NEWUTS, CLONE_NEWNET, CLONE_NEWNS};
-    int ns_fds[3]           = {-1, -1, -1};
-    char ns_path[128];
-    int entered_mnt = 0;
+    int argc, status;
     pid_t child;
-    int status;
-    int i;
 
     if (id == NULL || command_line == NULL || command_line[0] == '\0') {
         printf("[error] usage: exec <id> <command> [args...]\n\n");
@@ -2072,78 +2128,28 @@ int container_exec(const char *id, const char *command_line) {
                id, state_to_string(container->state));
         return -1;
     }
-
     if (snprintf(cmd_buf, sizeof(cmd_buf), "%s", command_line) >= (int)sizeof(cmd_buf)) {
         printf("[error] command too long\n\n");
         return -1;
     }
-
     argc = split_command_argv(cmd_buf, argv, (int)(sizeof(argv) / sizeof(argv[0])));
-    if (argc < 0) {
-        printf("[error] empty command\n\n");
-        return -1;
-    }
-
-    for (i = 0; i < 3; i++) {
-        snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/%s",
-                 (int)container->pid, ns_names[i]);
-        ns_fds[i] = open(ns_path, O_RDONLY);
-    }
+    if (argc < 0) { printf("[error] empty command\n\n"); return -1; }
 
     child = fork();
-    if (child < 0) {
-        printf("[error] fork failed: %s\n\n", strerror(errno));
-        for (i = 0; i < 3; i++) if (ns_fds[i] >= 0) close(ns_fds[i]);
-        return -1;
-    }
+    if (child < 0) { printf("[error] fork failed: %s\n\n", strerror(errno)); return -1; }
 
     if (child == 0) {
-        /* Enter UTS and NET namespaces — required for hostname/network isolation. */
-        for (i = 0; i < 2; i++) {
-            if (ns_fds[i] >= 0) {
-                if (setns(ns_fds[i], ns_types[i]) != 0) {
-                    /* Best-effort on WSL/unprivileged — silently skip. */
-                }
-                close(ns_fds[i]);
-            }
-        }
-
-        /* Enter mount namespace — gives the container's full filesystem view.
-         * Best-effort: on WSL or with restricted permissions this may fail, in
-         * which case fall back to the /proc/<pid>/root bind trick below. */
-        if (ns_fds[2] >= 0) {
-            if (setns(ns_fds[2], CLONE_NEWNS) == 0) {
-                entered_mnt = 1;
-            }
-            close(ns_fds[2]);
-        }
-
-        if (entered_mnt) {
-            /* We're in the container's mount namespace; / is already its rootfs. */
-            chdir("/");
-        } else {
-            /* Fallback: bind the container rootfs via /proc/<pid>/root. */
-            char root_path[128];
-            snprintf(root_path, sizeof(root_path), "/proc/%d/root", (int)container->pid);
-            if (chdir(root_path) == 0) {
-                chroot(".");
-                chdir("/");
-            }
-        }
-
+        exec_enter_namespaces(container->pid, 0);
         execvp(argv[0], argv);
         fprintf(stderr, "[exec] %s: %s\n", argv[0], strerror(errno));
         _exit(127);
     }
-
-    for (i = 0; i < 3; i++) if (ns_fds[i] >= 0) close(ns_fds[i]);
 
     waitpid(child, &status, 0);
     if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
         printf("[exec] command not found in container: %s\n\n", argv[0]);
         return -1;
     }
-
     log_event("%s EXEC \"%s\" (exit=%d)", container->id, command_line,
               WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     eventbus_emit(EVENT_EXEC_LAUNCHED, container->id, command_line,
@@ -2168,58 +2174,27 @@ int container_exec_quiet(const char *id, const char *command_line) {
     Container *container = NULL;
     char cmd_buf[256];
     char *argv[32];
-    int argc = 0;
-    const char *ns_names[] = {"uts", "net", "mnt"};
-    int ns_types[]          = {CLONE_NEWUTS, CLONE_NEWNET, CLONE_NEWNS};
-    int ns_fds[3]           = {-1, -1, -1};
-    char ns_path[128];
+    int argc, status;
     pid_t child;
-    int status, i;
 
     poll_states();
     container = find_container(id);
     if (!container || container->state != STATE_RUNNING || container->pid <= 0)
         return -1;
-
     if (snprintf(cmd_buf, sizeof(cmd_buf), "%s", command_line) >= (int)sizeof(cmd_buf))
         return -1;
-
     argc = split_command_argv(cmd_buf, argv, (int)(sizeof(argv) / sizeof(argv[0])));
     if (argc < 0) return -1;
 
-    for (i = 0; i < 3; i++) {
-        snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/%s",
-                 (int)container->pid, ns_names[i]);
-        ns_fds[i] = open(ns_path, O_RDONLY);
-    }
-
     child = fork();
-    if (child < 0) {
-        for (i = 0; i < 3; i++) if (ns_fds[i] >= 0) close(ns_fds[i]);
-        return -1;
-    }
+    if (child < 0) return -1;
 
     if (child == 0) {
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) { dup2(devnull, STDOUT_FILENO); dup2(devnull, STDERR_FILENO); close(devnull); }
-
-        for (i = 0; i < 2; i++) {
-            if (ns_fds[i] >= 0) { setns(ns_fds[i], ns_types[i]); close(ns_fds[i]); }
-        }
-        if (ns_fds[2] >= 0) {
-            if (setns(ns_fds[2], CLONE_NEWNS) == 0) chdir("/");
-            else {
-                char rp[128];
-                snprintf(rp, sizeof(rp), "/proc/%d/root", (int)container->pid);
-                if (chdir(rp) == 0) { chroot("."); chdir("/"); }
-            }
-            close(ns_fds[2]);
-        }
+        exec_enter_namespaces(container->pid, 1);
         execvp(argv[0], argv);
         _exit(127);
     }
 
-    for (i = 0; i < 3; i++) if (ns_fds[i] >= 0) close(ns_fds[i]);
     waitpid(child, &status, 0);
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
@@ -2713,12 +2688,17 @@ void container_prune_all(void) {
         cursor = next;
     }
 
-    /* reset sequence so next container starts from 0001 */
+    /* reset sequence to one past the highest ID still in use */
     next_sequence = 1;
+    for (Container *c = head; c != NULL; c = c->next) {
+        int val = 0;
+        if (sscanf(c->id, "container-%d", &val) == 1 && val >= next_sequence)
+            next_sequence = val + 1;
+    }
     save_metadata();
 
-    printf("[manager] pruned %d container%s — counter reset to 1\n\n",
-           deleted, deleted == 1 ? "" : "s");
+    printf("[manager] pruned %d container%s — counter reset to %d\n\n",
+           deleted, deleted == 1 ? "" : "s", next_sequence);
 }
 
 /* ── web API helpers ─────────────────────────────────────────────────────
@@ -2899,4 +2879,106 @@ int container_send_signal(const char *id, int sig) {
         }
     }
     return -1;
+}
+
+int container_inspect_json(const char *id, char *buf, int buflen) {
+    Container *c;
+    char started_buf[32] = "-", stopped_buf[32] = "-";
+    char id_j[CONTAINER_ID_LEN*2], name_j[CONTAINER_NAME_LEN*2];
+    char host_j[CONTAINER_HOSTNAME_LEN*2], cmd_j[CONTAINER_COMMAND_LEN*2];
+    char rootfs_j[CONTAINER_ROOTFS_LEN*2], image_j[IMAGE_REF_LEN*2];
+    char log_j[CONTAINER_LOG_PATH_LEN*2], ip_j[32], ports_j[256];
+
+    if (id == NULL || buf == NULL || buflen <= 2) return -1;
+
+    poll_states();
+    c = find_container(id);
+    if (c == NULL) return -1;
+
+    if (c->started_at > 0) {
+        struct tm *t = localtime(&c->started_at);
+        strftime(started_buf, sizeof(started_buf), "%Y-%m-%dT%H:%M:%S", t);
+    }
+    if (c->stopped_at > 0) {
+        struct tm *t = localtime(&c->stopped_at);
+        strftime(stopped_buf, sizeof(stopped_buf), "%Y-%m-%dT%H:%M:%S", t);
+    }
+
+    char pb[128] = "";
+    if (c->port_map_count > 0)
+        bridge_serialize_port_maps(c->port_maps, c->port_map_count, pb, sizeof(pb));
+
+    json_escape_copy(id_j,     sizeof(id_j),     c->id);
+    json_escape_copy(name_j,   sizeof(name_j),   c->name);
+    json_escape_copy(host_j,   sizeof(host_j),   c->hostname);
+    json_escape_copy(cmd_j,    sizeof(cmd_j),     c->command_line);
+    json_escape_copy(rootfs_j, sizeof(rootfs_j), c->rootfs);
+    json_escape_copy(image_j,  sizeof(image_j),  c->image_ref[0] ? c->image_ref : "");
+    json_escape_copy(log_j,    sizeof(log_j),    c->log_path);
+    json_escape_copy(ip_j,     sizeof(ip_j),     c->ip_address[0] ? c->ip_address : "");
+    json_escape_copy(ports_j,  sizeof(ports_j),  pb);
+
+    return snprintf(buf, (size_t)buflen,
+        "{"
+        "\"id\":\"%s\",\"name\":\"%s\",\"hostname\":\"%s\","
+        "\"state\":\"%s\",\"pid\":%d,"
+        "\"command\":\"%s\",\"image\":\"%s\",\"rootfs\":\"%s\","
+        "\"log_path\":\"%s\","
+        "\"started_at\":\"%s\",\"stopped_at\":\"%s\",\"exit_code\":%d,"
+        "\"ip\":\"%s\",\"ports\":\"%s\",\"veth_host\":\"%s\","
+        "\"cpu_seconds\":%u,\"memory_mb\":%u,\"max_processes\":%u,"
+        "\"privileged\":%s,\"readonly_rootfs\":%s,\"seccomp\":%s,"
+        "\"cap_keep\":\"0x%llx\""
+        "}",
+        id_j, name_j, host_j,
+        state_to_string(c->state), (int)c->pid,
+        cmd_j, image_j, rootfs_j,
+        log_j,
+        started_buf, stopped_buf, c->exit_code,
+        ip_j, ports_j, c->veth_host[0] ? c->veth_host : "",
+        c->resource_limits.cpu_seconds,
+        c->resource_limits.memory_mb,
+        c->resource_limits.max_processes,
+        c->security.privileged    ? "true" : "false",
+        c->security.readonly_rootfs ? "true" : "false",
+        c->security.seccomp_enabled ? "true" : "false",
+        (unsigned long long)c->security.cap_keep);
+}
+
+int container_network_json(char *buf, int buflen) {
+    Container *c;
+    int written = 0, first = 1;
+
+    if (buf == NULL || buflen <= 2) return -1;
+
+    int bridge_up = bridge_is_up();
+    written += snprintf(buf + written, (size_t)(buflen - written),
+        "{\"bridge_up\":%s,\"bridge_ip\":\"" BRIDGE_IP "\",\"containers\":[",
+        bridge_up ? "true" : "false");
+
+    for (c = head; c != NULL && written < buflen - 256; c = c->next) {
+        if (c->ip_address[0] == '\0' && c->veth_host[0] == '\0') continue;
+        char pb[128] = "";
+        if (c->port_map_count > 0)
+            bridge_serialize_port_maps(c->port_maps, c->port_map_count, pb, sizeof(pb));
+        char id_j[CONTAINER_ID_LEN*2], name_j[CONTAINER_NAME_LEN*2];
+        json_escape_copy(id_j,   sizeof(id_j),   c->id);
+        json_escape_copy(name_j, sizeof(name_j), c->name);
+        written += snprintf(buf + written, (size_t)(buflen - written),
+            "%s{\"id\":\"%s\",\"name\":\"%s\",\"state\":\"%s\","
+            "\"ip\":\"%s\",\"veth_host\":\"%s\",\"ports\":\"%s\"}",
+            first ? "" : ",",
+            id_j, name_j, state_to_string(c->state),
+            c->ip_address[0] ? c->ip_address : "",
+            c->veth_host[0]  ? c->veth_host  : "",
+            pb);
+        first = 0;
+    }
+
+    if (written < buflen - 2) {
+        buf[written++] = ']';
+        buf[written++] = '}';
+        buf[written]   = '\0';
+    }
+    return written;
 }

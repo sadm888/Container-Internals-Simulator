@@ -1,6 +1,7 @@
 #ifndef EVENTBUS_H
 #define EVENTBUS_H
 
+#include <stdint.h>
 #include <time.h>
 
 /*
@@ -67,7 +68,7 @@ typedef struct {
     char      container_id[64];
     char      detail[EVENTBUS_DETAIL_LEN];
     long      value;   /* type-specific numeric payload */
-    unsigned  seq;     /* monotonic sequence number     */
+    uint64_t  seq;     /* monotonic sequence number     */
 } Event;
 
 /* Initialise — call once at startup before any emit.
@@ -92,7 +93,7 @@ void eventbus_emit(EventType    type,
 const char *eventbus_type_name(EventType type);
 
 /* Current write sequence number (total events emitted). */
-unsigned eventbus_total(void);
+uint64_t eventbus_total(void);
 
 /*
  * Print the most recent `n` events to stdout.
@@ -106,7 +107,7 @@ void eventbus_print_recent(int n);
  * (i.e. eventbus_total() at the time of return).
  * Prints any new events since from_seq; returns immediately.
  */
-unsigned eventbus_drain_from(unsigned from_seq);
+uint64_t eventbus_drain_from(uint64_t from_seq);
 
 /*
  * Like eventbus_print_recent but filters by event type.

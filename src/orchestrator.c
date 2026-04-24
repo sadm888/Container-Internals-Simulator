@@ -219,7 +219,8 @@ static int parse_service(JNode *sobj, const char *name, Service *svc) {
     else if (rp && strcmp(rp, "on-failure") == 0) svc->restart = RESTART_ON_FAILURE;
     else                                          svc->restart = RESTART_NEVER;
 
-    svc->max_restarts = jp_int(jp_get(sobj, "max_restarts"), 0);
+    int mr = jp_int(jp_get(sobj, "max_restarts"), 0);
+    svc->max_restarts = (mr < 0) ? 0 : (mr > 1000 ? 1000 : mr);
 
     JNode *deps = jp_get(sobj, "depends_on");
     if (deps && deps->type == JN_ARR) {
@@ -235,10 +236,14 @@ static int parse_service(JNode *sobj, const char *name, Service *svc) {
         if (hcmd && hcmd[0]) {
             snprintf(svc->health.exec, sizeof(svc->health.exec), "%s", hcmd);
             svc->health.enabled         = 1;
-            svc->health.interval_ms     = jp_int(jp_get(hc, "interval_ms"),     5000);
-            svc->health.timeout_ms      = jp_int(jp_get(hc, "timeout_ms"),      1000);
-            svc->health.retries         = jp_int(jp_get(hc, "retries"),            3);
-            svc->health.start_period_ms = jp_int(jp_get(hc, "start_period_ms"), 1000);
+            int iv = jp_int(jp_get(hc, "interval_ms"),     5000);
+            int to = jp_int(jp_get(hc, "timeout_ms"),      1000);
+            int rt = jp_int(jp_get(hc, "retries"),            3);
+            int sp = jp_int(jp_get(hc, "start_period_ms"), 1000);
+            svc->health.interval_ms     = (iv < 100)   ? 100   : (iv > 300000 ? 300000 : iv);
+            svc->health.timeout_ms      = (to < 100)   ? 100   : (to > 60000  ? 60000  : to);
+            svc->health.retries         = (rt < 1)     ? 1     : (rt > 100    ? 100    : rt);
+            svc->health.start_period_ms = (sp < 0)     ? 0     : (sp > 300000 ? 300000 : sp);
         }
     }
     return 0;
@@ -250,7 +255,16 @@ int orch_parse_spec(const char *path, OrchestratorSpec *spec) {
 
     static char fbuf[64 * 1024];
     int flen = (int)fread(fbuf, 1, sizeof(fbuf) - 1, f);
+    int read_err = ferror(f);
     fclose(f);
+    if (read_err) {
+        printf("[orch] error reading spec '%s'\n\n", path);
+        return -1;
+    }
+    if (flen <= 0) {
+        printf("[orch] spec '%s' is empty\n\n", path);
+        return -1;
+    }
     fbuf[flen] = '\0';
 
     static JP jp;
@@ -352,7 +366,7 @@ int orch_validate(OrchestratorSpec *spec) {
  * blocking work, then re-acquires to update state.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-#define MON_TICK_MS 2000
+#define MON_TICK_MS 200
 
 typedef struct {
     int  idx;
@@ -623,6 +637,15 @@ int orch_run(OrchestratorSpec *spec) {
         printf("[orch] warning: monitor thread failed to start\n");
     }
 
+    /* Brief wait so the health-check thread can fire its first round
+     * before control returns to the CLI. Without this, an immediate
+     * 'orch status' always shows "checking" because the thread hasn't
+     * had CPU time yet. */
+    {
+        struct timespec ts = {1, 200000000}; /* 1.2 s — enough for one tick + health check */
+        nanosleep(&ts, NULL);
+    }
+
     eventbus_emit(EVENT_ORCH_SPEC_UP, spec->name, spec->spec_path, (long)spec->count);
     printf("\n[orch] '%s' is up.  Use 'orch status' to check health.\n\n", spec->name);
     return 0;
@@ -717,10 +740,12 @@ int orch_restart_service(const char *name) {
     svc->state             = SVC_RUNNING;
     svc->started_at        = time(NULL);
     svc->health_fail_count = 0;
+    svc->restart_count++;
     pthread_mutex_unlock(&g_lock);
 
-    eventbus_emit(EVENT_ORCH_SVC_RESTARTED, name, new_id, 0);
-    printf("[orch] service '%s' restarted  id=%s\n\n", name, new_id);
+    eventbus_emit(EVENT_ORCH_SVC_RESTARTED, name, new_id, (long)g_spec.services[idx].restart_count);
+    printf("[orch] service '%s' restarted (manual, count=%d)  id=%s\n\n",
+           name, g_spec.services[idx].restart_count, new_id);
     return 0;
 }
 
@@ -869,4 +894,51 @@ int cmd_orch(int argc, char **argv) {
 
     printf("[orch] unknown subcommand '%s' — try 'orch' for help\n\n", sub);
     return -1;
+}
+
+int orch_status_json(char *buf, int buflen) {
+    int written = 0;
+    int first = 1;
+
+    if (buf == NULL || buflen <= 2) return -1;
+
+    pthread_mutex_lock(&g_lock);
+
+    if (!g_running) {
+        pthread_mutex_unlock(&g_lock);
+        return snprintf(buf, (size_t)buflen, "{\"running\":false,\"services\":[]}");
+    }
+
+    written += snprintf(buf + written, (size_t)(buflen - written),
+        "{\"running\":true,\"spec\":\"%s\",\"services\":[", g_spec.name);
+
+    for (int i = 0; i < g_spec.count && written < buflen - 256; i++) {
+        Service *s = &g_spec.services[i];
+        char uptime_buf[32] = "-";
+        if (s->started_at > 0) {
+            long secs = (long)(time(NULL) - s->started_at);
+            if (secs < 60)        snprintf(uptime_buf, sizeof(uptime_buf), "%lds", secs);
+            else if (secs < 3600) snprintf(uptime_buf, sizeof(uptime_buf), "%ldm %lds", secs/60, secs%60);
+            else                  snprintf(uptime_buf, sizeof(uptime_buf), "%ldh %ldm", secs/3600, (secs%3600)/60);
+        }
+        written += snprintf(buf + written, (size_t)(buflen - written),
+            "%s{\"name\":\"%s\",\"state\":\"%s\",\"container_id\":\"%s\","
+            "\"restart_count\":%d,\"health_fail_count\":%d,\"uptime\":\"%s\","
+            "\"health_enabled\":%s}",
+            first ? "" : ",",
+            s->name, svc_state_str(s->state),
+            s->container_id[0] ? s->container_id : "",
+            s->restart_count, s->health_fail_count, uptime_buf,
+            s->health.enabled ? "true" : "false");
+        first = 0;
+    }
+
+    pthread_mutex_unlock(&g_lock);
+
+    if (written < buflen - 2) {
+        buf[written++] = ']';
+        buf[written++] = '}';
+        buf[written]   = '\0';
+    }
+    return written;
 }

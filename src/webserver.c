@@ -13,7 +13,10 @@
 #include "alert.h"
 #include "container.h"
 #include "eventbus.h"
+#include "image.h"
 #include "metrics.h"
+#include "orchestrator.h"
+#include "scheduler.h"
 #include "webserver.h"
 
 #define MAX_REQUEST   4096
@@ -21,6 +24,9 @@
 #define BUF_METRICS   4096
 #define BUF_CONTAINERS (256 * 1024)  /* 256 KB — up to ~700 containers */
 #define BUF_LOGS     16384
+#define BUF_IMAGES    16384
+#define BUF_ORCH       8192
+#define BUF_NETWORK   32768
 
 static int           g_server_fd = -1;
 static pthread_t     g_server_thread;
@@ -206,6 +212,15 @@ static void handle_connection(int fd) {
                 resp_not_found(fd);
                 return;
             }
+            /* Reject IDs with path-traversal characters */
+            for (int ci = 0; cid[ci]; ci++) {
+                char ch = cid[ci];
+                if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                      (ch >= '0' && ch <= '9') || ch == '-' || ch == '_')) {
+                    resp_not_found(fd);
+                    return;
+                }
+            }
 
             if (want <= 0) want = 40;
             if (want > 200) want = 200;
@@ -236,6 +251,52 @@ static void handle_connection(int fd) {
             resp_ok_json(fd, buf, len);
             free(buf);
 
+        } else if (strcmp(path, "/api/scheduler") == 0) {
+            char buf[256];
+            int len = scheduler_json(buf, sizeof(buf));
+            resp_ok_json(fd, buf, len);
+
+        } else if (strcmp(path, "/api/images") == 0) {
+            char *buf = malloc(BUF_IMAGES);
+            if (!buf) { resp_not_found(fd); return; }
+            int len = image_list_json(buf, BUF_IMAGES);
+            if (len < 0) { snprintf(buf, BUF_IMAGES, "[]"); len = 2; }
+            resp_ok_json(fd, buf, len);
+            free(buf);
+
+        } else if (strcmp(path, "/api/orch/status") == 0) {
+            char *buf = malloc(BUF_ORCH);
+            if (!buf) { resp_not_found(fd); return; }
+            int len = orch_status_json(buf, BUF_ORCH);
+            if (len < 0) { snprintf(buf, BUF_ORCH, "{\"running\":false,\"services\":[]}"); len = (int)strlen(buf); }
+            resp_ok_json(fd, buf, len);
+            free(buf);
+
+        } else if (strcmp(path, "/api/network") == 0) {
+            char *buf = malloc(BUF_NETWORK);
+            if (!buf) { resp_not_found(fd); return; }
+            int len = container_network_json(buf, BUF_NETWORK);
+            if (len < 0) { snprintf(buf, BUF_NETWORK, "{\"bridge_up\":false,\"containers\":[]}"); len = (int)strlen(buf); }
+            resp_ok_json(fd, buf, len);
+            free(buf);
+
+        } else if (strncmp(path, "/api/containers/", 16) == 0 &&
+                   strstr(path + 16, "/inspect") != NULL) {
+            char cid[64] = {0};
+            char buf[4096];
+            if (sscanf(path, "/api/containers/%63[^/]/inspect", cid) != 1) {
+                resp_not_found(fd); return;
+            }
+            for (int ci = 0; cid[ci]; ci++) {
+                char ch = cid[ci];
+                if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                      (ch >= '0' && ch <= '9') || ch == '-' || ch == '_'))
+                    { resp_not_found(fd); return; }
+            }
+            int len = container_inspect_json(cid, buf, sizeof(buf));
+            if (len < 0) { resp_not_found(fd); return; }
+            resp_ok_json(fd, buf, len);
+
         } else {
             resp_not_found(fd);
         }
@@ -243,6 +304,14 @@ static void handle_connection(int fd) {
     } else if (strcmp(method, "POST") == 0) {
         char cid[64] = {0};
         if (sscanf(path, "/api/containers/%63[^/]/stop", cid) == 1) {
+            int bad = 0;
+            for (int ci = 0; cid[ci]; ci++) {
+                char ch = cid[ci];
+                if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                      (ch >= '0' && ch <= '9') || ch == '-' || ch == '_'))
+                    { bad = 1; break; }
+            }
+            if (bad) { resp_not_found(fd); return; }
             if (container_send_signal(cid, SIGTERM) == 0)
                 resp_accepted(fd);
             else

@@ -20,6 +20,7 @@ let lastContainers  = [];
 let lastStats       = {};
 let lastMetrics     = {};
 let selectedLogId   = "";
+let logRequestSeq   = 0;
 
 /* ── DOM helpers ────────────────────────────────────────────────────── */
 const $  = id => document.getElementById(id);
@@ -28,7 +29,8 @@ const setHtml = (id, h) => { const el=$(id); if(el) el.innerHTML = h; };
 
 function escHtml(s) {
   return String(s ?? "")
-    .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+    .replace(/"/g,"&quot;").replace(/'/g,"&#39;");
 }
 
 function fmtUptime(s) {
@@ -88,9 +90,12 @@ function initNav() {
       const el = $(`view-${view}`);
       if (el) el.classList.add("active-view");
 
-      if (view === "metrics") renderMetricsView(lastMetrics);
-      if (view === "images")  renderImages(lastContainers);
-      if (view === "logs")    renderLogSelector(lastContainers);
+      if (view === "metrics")   renderMetricsView(lastMetrics);
+      if (view === "images")    fetch(`${API}/api/images`).then(r=>r.ok?r.json():[]).then(renderImages);
+      if (view === "logs")      renderLogSelector(lastContainers);
+      if (view === "network")   fetch(`${API}/api/network`).then(r=>r.ok?r.json():null).then(renderNetwork);
+      if (view === "scheduler") fetch(`${API}/api/scheduler`).then(r=>r.ok?r.json():null).then(renderScheduler);
+      if (view === "orch")      fetch(`${API}/api/orch/status`).then(r=>r.ok?r.json():null).then(renderOrch);
       refreshIcons();
     });
   });
@@ -241,21 +246,13 @@ function renderContainers(containers) {
   refreshIcons();
 }
 
-/* ── VIEW: Images ───────────────────────────────────────────────────── */
-function renderImages(containers) {
-  const seen = new Map();
-  containers.forEach(c => {
-    const img = c.image || "rootfs";
-    if (!seen.has(img)) seen.set(img, { count: 0, running: 0 });
-    seen.get(img).count++;
-    if (c.state === "RUNNING") seen.get(img).running++;
-  });
-
-  if (seen.size === 0) {
+/* ── VIEW: Images (from real registry API) ──────────────────────────── */
+function renderImages(images) {
+  if (!Array.isArray(images) || images.length === 0) {
     setHtml("image-list", `
       <div class="empty-state">
         ${icon("layers","icon-xl")}
-        <p>No image data yet — start a container</p>
+        <p>No images registered — use <code>image build</code> in the CLI</p>
       </div>`);
     refreshIcons();
     return;
@@ -263,17 +260,126 @@ function renderImages(containers) {
 
   const header = `
     <div class="img-row img-header">
-      <span>Image</span><span>Containers</span><span>Running</span>
+      <span>Name</span><span>Tag</span><span>Created</span><span>Rootfs</span>
     </div>`;
 
-  const rows = [...seen.entries()].map(([img, s]) => `
+  const rows = images.map(img => `
     <div class="img-row">
-      <div class="img-name">${escHtml(img)}</div>
-      <div>${s.count}</div>
-      <div>${s.running > 0 ? `<span style="color:var(--green);font-weight:600">${s.running}</span>` : "0"}</div>
+      <div class="img-name">${escHtml(img.name)}</div>
+      <div>${escHtml(img.tag)}</div>
+      <div class="u-muted">${escHtml(img.created_at || "—")}</div>
+      <div class="u-muted" style="font-size:11px;overflow:hidden;text-overflow:ellipsis">${escHtml(img.rootfs)}</div>
     </div>`);
 
   setHtml("image-list", header + rows.join(""));
+}
+
+/* ── VIEW: Network ──────────────────────────────────────────────────── */
+function renderNetwork(data) {
+  if (!data) return;
+
+  const bridgeHtml = `
+    <div class="stat-card">
+      <div class="stat-icon ${data.bridge_up ? "green" : "red"}">
+        ${icon("network","icon-xs")}
+      </div>
+      <div>
+        <div class="stat-value">
+          <span class="net-bridge-badge ${data.bridge_up ? "up" : "down"}">
+            ${data.bridge_up ? "UP" : "DOWN"}
+          </span>
+        </div>
+        <div class="stat-label">Bridge csbr0 · ${escHtml(data.bridge_ip || "172.17.0.1")}</div>
+      </div>
+    </div>`;
+  setHtml("network-bridge", bridgeHtml);
+
+  const containers = data.containers || [];
+  const statusEl = $("network-status");
+  if (statusEl) {
+    statusEl.textContent = `${containers.length} networked`;
+    statusEl.classList.remove("u-hidden");
+  }
+
+  if (containers.length === 0) {
+    setHtml("network-list", `
+      <div class="empty-state">
+        ${icon("network","icon-xl")}
+        <p>No networked containers — use <code>-p HOST:CTR</code> or bridge mode</p>
+      </div>`);
+    refreshIcons();
+    return;
+  }
+
+  const header = `<div class="net-row net-header">
+    <span>Name / ID</span><span>State</span><span>IP</span><span>Veth</span><span>Ports</span>
+  </div>`;
+  const rows = containers.map(c => `
+    <div class="net-row">
+      <div><div>${escHtml(c.name)}</div><div class="u-muted" style="font-size:11px">${escHtml(c.id)}</div></div>
+      <div>${badge(c.state)}</div>
+      <div>${escHtml(c.ip || "—")}</div>
+      <div class="u-muted">${escHtml(c.veth_host || "—")}</div>
+      <div class="u-muted">${escHtml(c.ports || "—")}</div>
+    </div>`);
+  setHtml("network-list", header + rows.join(""));
+  refreshIcons();
+}
+
+/* ── VIEW: Scheduler ────────────────────────────────────────────────── */
+function renderScheduler(data) {
+  if (!data) return;
+  setText("sched-enabled",  data.enabled ? "ON" : "OFF");
+  setText("sched-slice",    data.time_slice_ms != null ? data.time_slice_ms + " ms" : "—");
+  setText("sched-targets",  data.target_count != null ? String(data.target_count) : "—");
+  setText("sched-profile",  data.profile || "");
+  const el = $("sched-enabled");
+  if (el) el.style.color = data.enabled ? "var(--green)" : "var(--text-muted)";
+}
+
+/* ── VIEW: Orchestrator ─────────────────────────────────────────────── */
+function renderOrch(data) {
+  if (!data) return;
+
+  const specNameEl = $("orch-spec-name");
+  if (specNameEl) {
+    if (data.running) {
+      specNameEl.textContent = escHtml(data.spec || "");
+      specNameEl.classList.remove("u-hidden");
+    } else {
+      specNameEl.classList.add("u-hidden");
+    }
+  }
+
+  if (!data.running || !data.services || data.services.length === 0) {
+    setHtml("orch-list", `
+      <div class="empty-state">
+        ${icon("boxes","icon-xl")}
+        <p>No spec running — use <code>orch run &lt;spec.json&gt;</code> in the CLI</p>
+      </div>`);
+    refreshIcons();
+    return;
+  }
+
+  const stateClass = s => {
+    const map = { healthy:"orch-state-healthy", unhealthy:"orch-state-unhealthy",
+                  running:"orch-state-running", failed:"orch-state-failed",
+                  restarting:"orch-state-restarting", stopped:"orch-state-stopped" };
+    return map[s] || "orch-state-pending";
+  };
+
+  const header = `<div class="orch-row orch-header">
+    <span>Service</span><span>State</span><span>Restarts</span><span>Uptime</span><span>Container</span>
+  </div>`;
+  const rows = data.services.map(s => `
+    <div class="orch-row">
+      <div>${escHtml(s.name)}</div>
+      <div class="${stateClass(s.state)}">${escHtml(s.state)}</div>
+      <div>${s.restart_count ?? "—"}</div>
+      <div class="u-muted">${escHtml(s.uptime || "—")}</div>
+      <div class="u-muted" style="font-size:11px">${escHtml(s.container_id || "—")}</div>
+    </div>`);
+  setHtml("orch-list", header + rows.join(""));
 }
 
 /* ── VIEW: Events ───────────────────────────────────────────────────── */
@@ -310,6 +416,7 @@ function renderEvents(events) {
 
 async function fetchLogPreview(id) {
   const statusEl = $("log-status");
+  const requestSeq = ++logRequestSeq;
 
   if (!id) {
     if (statusEl) {
@@ -331,6 +438,10 @@ async function fetchLogPreview(id) {
 
     const data = await res.json();
     const lines = Array.isArray(data.lines) ? data.lines : [];
+
+    if (requestSeq !== logRequestSeq || id !== selectedLogId) {
+      return;
+    }
 
     if (statusEl) {
       statusEl.textContent = `${lines.length} lines`;
@@ -361,6 +472,9 @@ async function fetchLogPreview(id) {
       <div class="log-meta">${escHtml(data.log_path)}</div>
       <pre class="log-pre">${escHtml(lines.join("\n"))}</pre>`);
   } catch (_) {
+    if (requestSeq !== logRequestSeq || id !== selectedLogId) {
+      return;
+    }
     if (statusEl) {
       statusEl.textContent = "";
       statusEl.classList.add("u-hidden");
@@ -465,17 +579,21 @@ function renderAlerts(alerts) {
 /* ── Poll loop ──────────────────────────────────────────────────────── */
 async function poll() {
   try {
-    const [cRes, eRes, mRes, aRes, sRes] = await Promise.all([
+    const [cRes, eRes, mRes, aRes, sRes, imgRes, schedRes, orchRes, netRes] = await Promise.all([
       fetch(`${API}/api/containers`),
       fetch(`${API}/api/events?n=100`),
       fetch(`${API}/api/metrics`),
       fetch(`${API}/api/alerts`),
       fetch(`${API}/api/stats`),
+      fetch(`${API}/api/images`),
+      fetch(`${API}/api/scheduler`),
+      fetch(`${API}/api/orch/status`),
+      fetch(`${API}/api/network`),
     ]);
 
-    if (cRes.ok) lastContainers = await cRes.json();
-    if (mRes.ok) lastMetrics    = await mRes.json();
-    if (sRes.ok) lastStats      = await sRes.json();
+    if (cRes.ok)    lastContainers = await cRes.json();
+    if (mRes.ok)    lastMetrics    = await mRes.json();
+    if (sRes.ok)    lastStats      = await sRes.json();
 
     const alerts = aRes.ok ? await aRes.json() : [];
 
@@ -488,11 +606,19 @@ async function poll() {
       renderMetricsView(lastMetrics);
 
     if ($("view-images")?.classList.contains("active-view"))
-      renderImages(lastContainers);
+      renderImages(imgRes.ok ? await imgRes.json() : []);
 
     if ($("view-logs")?.classList.contains("active-view"))
       renderLogSelector(lastContainers);
 
+    if ($("view-network")?.classList.contains("active-view"))
+      renderNetwork(netRes.ok ? await netRes.json() : null);
+
+    if ($("view-scheduler")?.classList.contains("active-view"))
+      renderScheduler(schedRes.ok ? await schedRes.json() : null);
+
+    if ($("view-orch")?.classList.contains("active-view"))
+      renderOrch(orchRes.ok ? await orchRes.json() : null);
 
   } catch(_) {
   }

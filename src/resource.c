@@ -141,8 +141,13 @@ static int write_cgroup_file(const char *cgroup_path, const char *filename, cons
     if (f == NULL) {
         return -1;
     }
-    fputs(value, f);
-    fclose(f);
+    if (fputs(value, f) == EOF) {
+        int saved = errno;
+        fclose(f);
+        errno = saved;
+        return -1;
+    }
+    if (fclose(f) != 0) return -1;
     return 0;
 }
 
@@ -174,7 +179,8 @@ int resource_try_cgroup(const char *container_id, const ResourceConfig *config, 
 
     if (config->max_processes != 0) {
         snprintf(value, sizeof(value), "%u\n", config->max_processes);
-        write_cgroup_file(cgroup_path, "pids.max", value);
+        if (write_cgroup_file(cgroup_path, "pids.max", value) != 0)
+            fprintf(stderr, "[warn] could not set pids.max: %s\n", strerror(errno));
     }
 
     /* cpu_seconds is a total-time budget enforced by RLIMIT_CPU in the child.

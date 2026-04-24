@@ -16,7 +16,7 @@ WORKLOADS = $(BIN_DIR)/workload-cpu $(BIN_DIR)/workload-mem \
 all: $(TARGET) workloads
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^ -lreadline
 
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<

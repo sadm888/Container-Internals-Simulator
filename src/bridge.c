@@ -439,6 +439,10 @@ int bridge_parse_port_maps(const char *str,
 
         if (sscanf(tok, "%d:%d/%3s", &hp, &cp, proto) >= 2 ||
             sscanf(tok, "%d:%d", &hp, &cp) == 2) {
+            if (hp < 1 || hp > 65535 || cp < 1 || cp > 65535) {
+                tok = strtok(NULL, ",");
+                continue;
+            }
             pm->host_port = (uint16_t)hp;
             pm->container_port = (uint16_t)cp;
             snprintf(pm->proto, sizeof(pm->proto), "%s", proto);

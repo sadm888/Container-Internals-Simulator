@@ -23,5 +23,8 @@ void scheduler_clear_targets(void);
 
 const char *scheduler_profile(void);
 
+/* Serialise current scheduler state to JSON. Returns bytes written. */
+int scheduler_json(char *buf, int buflen);
+
 #endif
 

@@ -357,3 +357,29 @@ int image_remove(const char *name, const char *tag) {
     }
     return 0;
 }
+
+int image_list_json(char *buf, int buflen) {
+    ImageRecord records[64];
+    int count = load_registry(records, 64);
+    int written = 0;
+    int first = 1;
+
+    if (buf == NULL || buflen <= 2) return -1;
+    written += snprintf(buf + written, (size_t)(buflen - written), "[");
+
+    for (int i = 0; i < count && written < buflen - 256; i++) {
+        char ts[32] = "-";
+        if (records[i].created_at > 0) {
+            struct tm *tm_s = localtime(&records[i].created_at);
+            strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", tm_s);
+        }
+        written += snprintf(buf + written, (size_t)(buflen - written),
+            "%s{\"name\":\"%s\",\"tag\":\"%s\",\"rootfs\":\"%s\",\"created_at\":\"%s\"}",
+            first ? "" : ",",
+            records[i].name, records[i].tag, records[i].rootfs, ts);
+        first = 0;
+    }
+
+    if (written < buflen - 1) { buf[written++] = ']'; buf[written] = '\0'; }
+    return written;
+}

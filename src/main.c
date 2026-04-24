@@ -1,6 +1,9 @@
 #include <dirent.h>
 #include <errno.h>
+#include <readline/history.h>
+#include <readline/readline.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -234,7 +237,11 @@ static int parse_limit_flags(char **args, int argc, int *index,
 int main(void) {
     char line[256];
 
-    (void)signal(SIGINT, on_sigint);
+    struct sigaction sa = {0};
+    sa.sa_handler = on_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;  /* no SA_RESTART so fgets/read are interrupted */
+    sigaction(SIGINT, &sa, NULL);
 
     initialize_runtime_state();
     eventbus_init();
@@ -258,29 +265,42 @@ int main(void) {
         int argc = 0;
 
         if (interactive) {
-            printf("container-sim> ");
-            fflush(stdout);
-        }
-
-        if (fgets(line, sizeof(line), stdin) == NULL) {
-            if (errno == EINTR || container_consume_interrupt()) {
-                clearerr(stdin);
+            char *rl = readline("container-sim> ");
+            if (rl == NULL) {
+                /* EOF / Ctrl+D */
                 printf("\n");
-                continue;
+                webserver_stop();
+                orch_down();
+                cleanup_all_containers();
+                metrics_save("metrics.state");
+                eventbus_close();
+                log_event("=== simulator stopped ===");
+                break;
             }
-            printf("\n");
-            webserver_stop();
-            orch_down();
-            cleanup_all_containers();
-            metrics_save("metrics.state");
-            eventbus_close();
-            log_event("=== simulator stopped ===");
-            break;
-        }
-
-        line[strcspn(line, "\n")] = '\0';
-        if (line[0] == '\0') {
-            continue;
+            if (container_consume_interrupt()) { free(rl); printf("\n"); continue; }
+            /* strip leading/trailing whitespace check */
+            if (rl[0] == '\0') { free(rl); continue; }
+            add_history(rl);
+            snprintf(line, sizeof(line), "%s", rl);
+            free(rl);
+        } else {
+            if (fgets(line, sizeof(line), stdin) == NULL) {
+                if (errno == EINTR || container_consume_interrupt()) {
+                    clearerr(stdin);
+                    printf("\n");
+                    continue;
+                }
+                printf("\n");
+                webserver_stop();
+                orch_down();
+                cleanup_all_containers();
+                metrics_save("metrics.state");
+                eventbus_close();
+                log_event("=== simulator stopped ===");
+                break;
+            }
+            line[strcspn(line, "\n")] = '\0';
+            if (line[0] == '\0') continue;
         }
 
         argc = parse_command(line, args, (int)(sizeof(args) / sizeof(args[0])));
@@ -646,7 +666,7 @@ int main(void) {
             if (!ev_ok) {
                 /* error already printed */
             } else if (follow) {
-                unsigned int cursor = eventbus_total();
+                uint64_t cursor = eventbus_total();
                 printf("[hint] streaming events — press Ctrl+C to stop\n");
                 while (1) {
                     if (container_consume_interrupt()) { printf("\n"); break; }
